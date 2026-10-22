@@ -370,3 +370,4 @@ class LeumiScraper extends BaseScraperWithBrowser<ScraperSpecificCredentials> {
 }
 
 export default LeumiScraper;
+export { LeumiScraper };
