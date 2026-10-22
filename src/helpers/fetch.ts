@@ -9,11 +9,9 @@ function getJsonHeaders() {
   };
 }
 
-function assertAutomationNotBlocked(status: number, responseText: string | null, url: string) {
+function assertAutomationNotBlocked(status: number, responseText: string | null) {
   if (status === 429 || (responseText && /block automation|bot detection/i.test(responseText))) {
-    throw new Error(
-      `Automation detected and blocked by server. Status: ${status}, URL: ${url}. The site is actively blocking automated access. Consider: 1) Using showBrowser:true, 2) Adding longer delays, 3) Using residential proxies, 4) Running at different times of day`,
-    );
+    throw new Error('PROVIDER_AUTOMATION_BLOCKED');
   }
 }
 
@@ -25,14 +23,15 @@ export async function fetchGet<TResult>(url: string, extraHeaders: Record<string
   const request = {
     method: 'GET',
     headers,
+    redirect: 'error' as const,
   };
-  const fetchResult = await fetch(url, request);
-
-  if (fetchResult.status !== 200) {
-    throw new Error(`sending a request to the institute server returned with status code ${fetchResult.status}`);
+  try {
+    const fetchResult = await fetch(url, request);
+    if (fetchResult.status !== 200) throw new Error();
+    return await fetchResult.json();
+  } catch {
+    throw new Error('PROVIDER_REQUEST_FAILED');
   }
-
-  return fetchResult.json();
 }
 
 export async function fetchPost<TResult = any>(
@@ -44,9 +43,15 @@ export async function fetchPost<TResult = any>(
     method: 'POST',
     headers: { ...getJsonHeaders(), ...extraHeaders },
     body: JSON.stringify(data),
+    redirect: 'error' as const,
   };
-  const result = await fetch(url, request);
-  return result.json();
+  try {
+    const result = await fetch(url, request);
+    if (!result.ok) throw new Error();
+    return await result.json();
+  } catch {
+    throw new Error('PROVIDER_REQUEST_FAILED');
+  }
 }
 
 export async function fetchGraphql<TResult>(
@@ -57,7 +62,7 @@ export async function fetchGraphql<TResult>(
 ): Promise<TResult> {
   const result = await fetchPost(url, { operationName: null, query, variables }, extraHeaders);
   if (result.errors?.length) {
-    throw new Error(result.errors[0].message);
+    throw new Error('PROVIDER_GRAPHQL_FAILED');
   }
   return result.data as Promise<TResult>;
 }
@@ -67,23 +72,25 @@ export async function fetchGetWithinPage<TResult>(
   url: string,
   ignoreErrors = false,
 ): Promise<TResult | null> {
-  const [result, status] = await page.evaluate(async innerUrl => {
-    let response: Response | undefined;
-    try {
-      response = await fetch(innerUrl, { credentials: 'include' });
-      if (response.status === 204) {
-        return [null, response.status] as const;
+  const [result, status] = await page
+    .evaluate(async innerUrl => {
+      let response: Response | undefined;
+      try {
+        response = await fetch(innerUrl, { credentials: 'include' });
+        if (response.status === 204) {
+          return [null, response.status] as const;
+        }
+        return [await response.text(), response.status] as const;
+      } catch (e) {
+        throw new Error('PROVIDER_REQUEST_FAILED');
       }
-      return [await response.text(), response.status] as const;
-    } catch (e) {
-      throw new Error(
-        `fetchGetWithinPage error: ${e instanceof Error ? `${e.message}\n${e.stack}` : String(e)}, url: ${innerUrl}, status: ${response?.status}`,
-      );
-    }
-  }, url);
+    }, url)
+    .catch(() => {
+      throw new Error('PROVIDER_REQUEST_FAILED');
+    });
 
   if (!ignoreErrors) {
-    assertAutomationNotBlocked(status, result, url);
+    assertAutomationNotBlocked(status, result);
   }
 
   if (result !== null) {
@@ -91,9 +98,7 @@ export async function fetchGetWithinPage<TResult>(
       return JSON.parse(result);
     } catch (e) {
       if (!ignoreErrors) {
-        throw new Error(
-          `fetchGetWithinPage parse error: ${e instanceof Error ? `${e.message}\n${e.stack}` : String(e)}, url: ${url}, result: ${result}, status: ${status}`,
-        );
+        throw new Error('PROVIDER_RESPONSE_INVALID');
       }
     }
   }
@@ -107,30 +112,34 @@ export async function fetchPostWithinPage<TResult>(
   extraHeaders: Record<string, any> = {},
   ignoreErrors = false,
 ): Promise<TResult | null> {
-  const [resultText, status] = await page.evaluate(
-    async (innerUrl: string, innerData: Record<string, any>, innerExtraHeaders: Record<string, any>) => {
-      const response = await fetch(innerUrl, {
-        method: 'POST',
-        body: JSON.stringify(innerData),
-        credentials: 'include',
+  const [resultText, status] = await page
+    .evaluate(
+      async (innerUrl: string, innerData: Record<string, any>, innerExtraHeaders: Record<string, any>) => {
+        const response = await fetch(innerUrl, {
+          method: 'POST',
+          body: JSON.stringify(innerData),
+          credentials: 'include',
 
-        headers: Object.assign(
-          { 'Content-Type': 'application/x-www-form-urlencoded; charset=UTF-8' },
-          innerExtraHeaders,
-        ),
-      });
-      if (response.status === 204) {
-        return [null, response.status] as const;
-      }
-      return [await response.text(), response.status] as const;
-    },
-    url,
-    data,
-    extraHeaders,
-  );
+          headers: Object.assign(
+            { 'Content-Type': 'application/x-www-form-urlencoded; charset=UTF-8' },
+            innerExtraHeaders,
+          ),
+        });
+        if (response.status === 204) {
+          return [null, response.status] as const;
+        }
+        return [await response.text(), response.status] as const;
+      },
+      url,
+      data,
+      extraHeaders,
+    )
+    .catch(() => {
+      throw new Error('PROVIDER_REQUEST_FAILED');
+    });
 
   if (!ignoreErrors) {
-    assertAutomationNotBlocked(status, resultText, url);
+    assertAutomationNotBlocked(status, resultText);
   }
 
   try {
@@ -139,9 +148,7 @@ export async function fetchPostWithinPage<TResult>(
     }
   } catch (e) {
     if (!ignoreErrors) {
-      throw new Error(
-        `fetchPostWithinPage parse error: ${e instanceof Error ? `${e.message}\n${e.stack}` : String(e)}, url: ${url}, data: ${JSON.stringify(data)}, extraHeaders: ${JSON.stringify(extraHeaders)}, result: ${resultText}`,
-      );
+      throw new Error('PROVIDER_RESPONSE_INVALID');
     }
   }
   return null;

@@ -6,6 +6,9 @@ on:
       - next
 jobs:
   release:
+    # A downstream security fork is consumed by immutable commit, not published
+    # under the upstream npm package name or released automatically on merge.
+    if: github.repository == 'eshaham/israeli-bank-scrapers'
     name: Release
     runs-on: ubuntu-latest
     environment: npm-publish

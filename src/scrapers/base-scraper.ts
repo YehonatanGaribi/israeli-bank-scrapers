@@ -28,14 +28,13 @@ export class BaseScraper<TCredentials extends ScraperCredentials> implements Scr
 
   async scrape(credentials: TCredentials): Promise<ScraperScrapingResult> {
     this.emitProgress(ScraperProgressTypes.StartScraping);
-    await this.initialize();
-
     let loginResult;
     try {
+      await this.initialize();
       loginResult = await this.login(credentials);
     } catch (e) {
       loginResult =
-        e instanceof TimeoutError ? createTimeoutError((e as Error).message) : createGenericError((e as Error).message);
+        e instanceof TimeoutError ? createTimeoutError('PROVIDER_TIMEOUT') : createGenericError('PROVIDER_UNAVAILABLE');
     }
 
     let scrapeResult;
@@ -45,8 +44,8 @@ export class BaseScraper<TCredentials extends ScraperCredentials> implements Scr
       } catch (e) {
         scrapeResult =
           e instanceof TimeoutError
-            ? createTimeoutError((e as Error).message)
-            : createGenericError((e as Error).message);
+            ? createTimeoutError('PROVIDER_TIMEOUT')
+            : createGenericError('PROVIDER_UNAVAILABLE');
       }
     } else {
       scrapeResult = loginResult;
@@ -56,7 +55,7 @@ export class BaseScraper<TCredentials extends ScraperCredentials> implements Scr
       const success = scrapeResult && scrapeResult.success === true;
       await this.terminate(success);
     } catch (e) {
-      scrapeResult = createGenericError((e as Error).message);
+      scrapeResult = createGenericError('PROVIDER_UNAVAILABLE');
     }
     this.emitProgress(ScraperProgressTypes.EndScraping);
 
