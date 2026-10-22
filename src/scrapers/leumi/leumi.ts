@@ -26,6 +26,26 @@ const CHANGE_PASSWORD_MODAL_SELECTOR = 'form input[name="newPwd"]';
 type DesktopTransactionLimits = { maxAccounts: number; maxRows: number };
 type DesktopRowBudget = { remaining: number };
 
+function validateDesktopRows(rows: any[] | null) {
+  for (const row of rows ?? []) {
+    // Moment accepts an absent input as the current time. The desktop path
+    // must reject missing source dates rather than manufacture a booking date.
+    if (
+      !row ||
+      typeof row.DateUTC !== 'string' ||
+      row.DateUTC.length > 40 ||
+      !/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{1,7})?(?:Z|[+-]\d{2}:\d{2})$/.test(row.DateUTC) ||
+      !moment.parseZone(row.DateUTC, moment.ISO_8601, true).isValid() ||
+      typeof row.Amount !== 'number' ||
+      !Number.isFinite(row.Amount) ||
+      typeof row.Description !== 'string' ||
+      row.Description.length > 2000
+    ) {
+      throw new Error('PROVIDER_UNAVAILABLE');
+    }
+  }
+}
+
 export function getLeumiMinimumStartDate(now = new Date()): Date {
   return moment(now).tz('Asia/Jerusalem').subtract(3, 'years').add(1, 'day').startOf('day').toDate();
 }
@@ -188,10 +208,14 @@ async function fetchTransactionsForAccount(
   // we must blur the from control otherwise the search will use the previous value
   await page.focus("button[aria-label='סנן']");
 
-  await clickButton(page, "button[aria-label='סנן']");
-  const finalResponse = await page.waitForResponse(response => {
+  const responsePending = page.waitForResponse(response => {
     return response.url() === FILTERED_TRANSACTIONS_URL && response.request().method() === 'POST';
   });
+  // Subscribe before the click: a fast response can arrive before click resolves.
+  // A failed click must not leave a later timeout as an unhandled rejection.
+  void responsePending.catch(() => undefined);
+  await clickButton(page, "button[aria-label='סנן']");
+  const finalResponse = await responsePending;
 
   const responseJson: any = await finalResponse.json();
 
@@ -218,7 +242,11 @@ async function fetchTransactionsForAccount(
   ) {
     throw new Error('PROVIDER_UNAVAILABLE');
   }
-  if (budget) budget.remaining -= (pendingTransactions?.length ?? 0) + (transactions?.length ?? 0);
+  if (budget) {
+    validateDesktopRows(pendingTransactions);
+    validateDesktopRows(transactions);
+    budget.remaining -= (pendingTransactions?.length ?? 0) + (transactions?.length ?? 0);
+  }
   const balance = response.BalanceDisplay ? parseFloat(response.BalanceDisplay) : undefined;
 
   const pendingTxns = extractTransactionsFromPage(pendingTransactions, TransactionStatuses.Pending, options);

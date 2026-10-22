@@ -28,7 +28,9 @@ function fixture(
     }),
     evaluate: jest.fn(async () => accountIds),
     waitForSelector: jest.fn(async () => undefined),
-    $eval: jest.fn(async () => undefined),
+    $eval: jest.fn(async (selector: string) => {
+      void selector;
+    }),
     type: jest.fn(async (selector: string, value: string) => {
       void selector;
       void value;
@@ -75,6 +77,33 @@ test('desktop hook reuses original history/pending parser and never requests sav
     'https://hb2.bankleumi.co.il/eBanking/SO/SPA.aspx#/ts/BusinessAccountTrx?WidgetPar=1',
   );
   expect(page.type.mock.calls).toEqual([['input[formcontrolname="txtInputFrom"]', '01.10.26']]);
+  const filterClick = page.$eval.mock.calls.findIndex(call => call[0] === "button[aria-label='סנן']");
+  expect(page.waitForResponse.mock.invocationCallOrder[0]).toBeLessThan(
+    page.$eval.mock.invocationCallOrder[filterClick],
+  );
+});
+
+test('desktop hook refuses missing or malformed source dates and amounts before mapping', async () => {
+  for (const override of [
+    { DateUTC: undefined },
+    { DateUTC: null },
+    { DateUTC: '2026-02-30T12:00:00Z' },
+    { DateUTC: '2026-10-20' },
+    { DateUTC: '2026-10-20T12:00:00' },
+    { Amount: '12.34' },
+    { Description: null },
+  ]) {
+    const { scraper } = fixture(
+      ['12-34'],
+      [{ TodayTransactionsItems: [], HistoryTransactionsItems: [{ ...transaction, ...override }] }],
+    );
+    await scraper.initialize();
+    const rejected = expect(scraper.fetchDesktopTransactions({ maxAccounts: 20, maxRows: 5000 })).rejects.toThrow(
+      'PROVIDER_UNAVAILABLE',
+    );
+    await jest.runAllTimersAsync();
+    await rejected;
+  }
 });
 
 test('desktop hook rejects empty, malformed, duplicate and excessive account lists before account selection', async () => {
