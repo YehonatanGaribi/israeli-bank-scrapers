@@ -282,7 +282,7 @@ export default class OneZeroScraper extends BaseScraper<ScraperSpecificCredentia
     debug('Triggering user supplied otpCodeRetriever callback');
     const triggerResult = await this.triggerTwoFactorAuth(credentials.phoneNumber);
 
-    if (!triggerResult.success) {
+    if (triggerResult.success === false) {
       return triggerResult;
     }
 
@@ -543,3 +543,6 @@ export default class OneZeroScraper extends BaseScraper<ScraperSpecificCredentia
     await super.terminate(success);
   }
 }
+
+// Named export is stable for ESM hosts consuming this CommonJS TypeScript source.
+export { OneZeroScraper };
