@@ -428,10 +428,83 @@ export type MaxDesktopStage =
   | 'transactionMetadata'
   | 'transactionReference';
 
+const MAX_DESKTOP_COMPATIBILITY_FIELDS = [
+  'purchaseDate',
+  'paymentDate',
+  'actualPaymentAmount',
+  'paymentCurrency',
+  'originalCurrency',
+  'originalAmount',
+  'shortCardNumber',
+  'planName',
+  'planTypeId',
+  'comments',
+  'merchantName',
+  'dealData',
+  'arn',
+] as const;
+
+const MAX_DESKTOP_COMPATIBILITY_KINDS = [
+  'missing',
+  'null',
+  'boolean',
+  'safeInteger',
+  'decimalNumber',
+  'unsafeNumber',
+  'integerString',
+  'decimalString',
+  'emptyString',
+  'text',
+  'date',
+  'localTimestamp',
+  'zonedTimestamp',
+  'object',
+  'array',
+  'unsupported',
+] as const;
+
+export type MaxDesktopCompatibilityField = (typeof MAX_DESKTOP_COMPATIBILITY_FIELDS)[number];
+export type MaxDesktopCompatibilityKind = (typeof MAX_DESKTOP_COMPATIBILITY_KINDS)[number];
+export interface MaxDesktopCompatibilityEntry {
+  readonly field: MaxDesktopCompatibilityField;
+  readonly kinds: readonly MaxDesktopCompatibilityKind[];
+}
+export type MaxDesktopCompatibilityProfile = readonly MaxDesktopCompatibilityEntry[];
+
+function safeDesktopCompatibility(value: unknown): MaxDesktopCompatibilityProfile | undefined {
+  try {
+    if (!Array.isArray(value) || value.length !== MAX_DESKTOP_COMPATIBILITY_FIELDS.length) return undefined;
+    const profile: MaxDesktopCompatibilityEntry[] = [];
+    for (let index = 0; index < MAX_DESKTOP_COMPATIBILITY_FIELDS.length; index += 1) {
+      const entry: unknown = value[index];
+      if (!entry || typeof entry !== 'object' || Array.isArray(entry)) return undefined;
+      const record = entry as Record<string, unknown>;
+      if (
+        Object.keys(record).sort().join(',') !== 'field,kinds' ||
+        record.field !== MAX_DESKTOP_COMPATIBILITY_FIELDS[index]
+      )
+        return undefined;
+      if (!Array.isArray(record.kinds) || record.kinds.length > MAX_DESKTOP_COMPATIBILITY_KINDS.length)
+        return undefined;
+      const kinds: MaxDesktopCompatibilityKind[] = [];
+      for (const kind of record.kinds) {
+        if (!MAX_DESKTOP_COMPATIBILITY_KINDS.includes(kind as MaxDesktopCompatibilityKind)) return undefined;
+        kinds.push(kind as MaxDesktopCompatibilityKind);
+      }
+      if (new Set(kinds).size !== kinds.length || kinds.join(',') !== [...kinds].sort().join(',')) return undefined;
+      profile.push(Object.freeze({ field: MAX_DESKTOP_COMPATIBILITY_FIELDS[index], kinds: Object.freeze(kinds) }));
+    }
+    return Object.freeze(profile);
+  } catch {
+    return undefined;
+  }
+}
+
 export interface MaxDesktopDiagnostic {
   readonly stage: MaxDesktopStage;
   readonly reason: 'UNAVAILABLE';
   readonly httpStatus: number | null;
+  readonly compatibility?: MaxDesktopCompatibilityProfile;
 }
 
 /** Only fixed diagnostics may cross the desktop worker boundary. */
@@ -441,7 +514,7 @@ export class MaxDesktopError extends Error {
   readonly httpStatus: number | null;
   readonly diagnostic: MaxDesktopDiagnostic;
 
-  constructor(stage: MaxDesktopStage, httpStatus: number | null = null) {
+  constructor(stage: MaxDesktopStage, httpStatus: number | null = null, compatibility?: unknown) {
     super('PROVIDER_UNAVAILABLE');
     this.name = 'MaxDesktopError';
     this.stage = MAX_DESKTOP_STAGES.includes(stage) ? stage : 'transactionsValidation';
@@ -449,7 +522,16 @@ export class MaxDesktopError extends Error {
       typeof httpStatus === 'number' && Number.isInteger(httpStatus) && httpStatus >= 100 && httpStatus <= 599
         ? httpStatus
         : null;
-    this.diagnostic = Object.freeze({ stage: this.stage, reason: this.reason, httpStatus: this.httpStatus });
+    const profile =
+      this.httpStatus === 200 && this.stage !== 'transactionsRequest' && this.stage !== 'transactionsResponse'
+        ? safeDesktopCompatibility(compatibility)
+        : undefined;
+    this.diagnostic = Object.freeze({
+      stage: this.stage,
+      reason: this.reason,
+      httpStatus: this.httpStatus,
+      ...(profile ? { compatibility: profile } : {}),
+    });
     Object.freeze(this);
   }
 }
@@ -491,6 +573,56 @@ function desktopDay(value: unknown): string | undefined {
   const day = value.slice(0, 10);
   const timestamp = Date.parse(`${day}T00:00:00Z`);
   return Number.isFinite(timestamp) && new Date(timestamp).toISOString().slice(0, 10) === day ? day : undefined;
+}
+
+function desktopCompatibilityKind(value: unknown, field: MaxDesktopCompatibilityField): MaxDesktopCompatibilityKind {
+  if (value === undefined) return 'missing';
+  if (value === null) return 'null';
+  if (typeof value === 'boolean') return 'boolean';
+  if (typeof value === 'number') {
+    if (Number.isSafeInteger(value)) return 'safeInteger';
+    return Number.isFinite(value) && !Number.isInteger(value) ? 'decimalNumber' : 'unsafeNumber';
+  }
+  if (typeof value === 'string') {
+    if (!value.length) return 'emptyString';
+    if ((field === 'purchaseDate' || field === 'paymentDate') && desktopDay(value)) {
+      if (value.length === 10) return 'date';
+      return /(?:Z|[+-]\d{2}:\d{2})$/.test(value) ? 'zonedTimestamp' : 'localTimestamp';
+    }
+    if (value.trim() === value) {
+      if (/^-?\d+$/.test(value)) return 'integerString';
+      if (/^-?\d+\.\d+$/.test(value)) return 'decimalString';
+    }
+    return 'text';
+  }
+  if (Array.isArray(value)) return 'array';
+  if (typeof value === 'object') return 'object';
+  return 'unsupported';
+}
+
+/** Inspect only fixed consumed fields, never values, unknown keys or row counts.
+ * Aggregate the complete bounded month before validating its first transaction. */
+function desktopCompatibility(rows: unknown[]): MaxDesktopCompatibilityProfile {
+  const fields = MAX_DESKTOP_COMPATIBILITY_FIELDS.map(field => ({
+    field,
+    kinds: new Set<MaxDesktopCompatibilityKind>(),
+  }));
+  for (const value of rows) {
+    if (!value || typeof value !== 'object' || Array.isArray(value)) continue;
+    const row = value as Record<string, unknown>;
+    if (!row.planName) continue;
+    for (const { field, kinds } of fields) {
+      const dealData = row.dealData;
+      const consumed =
+        field === 'arn'
+          ? dealData && typeof dealData === 'object' && !Array.isArray(dealData)
+            ? (dealData as Record<string, unknown>).arn
+            : undefined
+          : row[field];
+      kinds.add(desktopCompatibilityKind(consumed, field));
+    }
+  }
+  return fields.map(({ field, kinds }) => ({ field, kinds: Array.from(kinds).sort() }));
 }
 
 export function getMaxMinimumStartDate(): Date {
@@ -666,19 +798,25 @@ export class MaxScraper extends BaseScraperWithBrowser<ScraperSpecificCredential
           throw new MaxDesktopError('transactionsResponse', 200);
         if ((scanned += envelope.transactions.length) > limits.maxRows)
           throw new MaxDesktopError('transactionsValidation', 200);
-        for (const raw of envelope.transactions) {
-          if (!raw || typeof raw !== 'object' || Array.isArray(raw))
-            throw new MaxDesktopError('transactionsValidation', 200);
-          // The ordinary Max parser skips summary rows without a plan type.
-          // They still count toward the raw response budget above.
-          if (!raw.planName) continue;
-          const { accountNumber, transaction } = desktopTransaction(raw);
-          if (!accounts.has(accountNumber)) accounts.set(accountNumber, []);
-          if (accounts.size > limits.maxAccounts) throw new MaxDesktopError('transactionsValidation', 200);
-          // Billing-month queries can include adjacent dates. Preserve the actual
-          // settlement date; never invoke fixInstallments or guess a charge date.
-          const day = transaction.processedDate.slice(0, 10);
-          if (day >= limits.from && day <= limits.to) accounts.get(accountNumber)!.push(transaction);
+        const compatibility = desktopCompatibility(envelope.transactions);
+        try {
+          for (const raw of envelope.transactions) {
+            if (!raw || typeof raw !== 'object' || Array.isArray(raw))
+              throw new MaxDesktopError('transactionsValidation', 200);
+            // The ordinary Max parser skips summary rows without a plan type.
+            // They still count toward the raw response budget above.
+            if (!raw.planName) continue;
+            const { accountNumber, transaction } = desktopTransaction(raw);
+            if (!accounts.has(accountNumber)) accounts.set(accountNumber, []);
+            if (accounts.size > limits.maxAccounts) throw new MaxDesktopError('transactionsValidation', 200);
+            // Billing-month queries can include adjacent dates. Preserve the actual
+            // settlement date; never invoke fixInstallments or guess a charge date.
+            const day = transaction.processedDate.slice(0, 10);
+            if (day >= limits.from && day <= limits.to) accounts.get(accountNumber)!.push(transaction);
+          }
+        } catch (error) {
+          if (error instanceof MaxDesktopError) throw new MaxDesktopError(error.stage, error.httpStatus, compatibility);
+          throw new MaxDesktopError('transactionsValidation', 200, compatibility);
         }
       }
       return { success: true, accounts: Array.from(accounts, ([accountNumber, txns]) => ({ accountNumber, txns })) };

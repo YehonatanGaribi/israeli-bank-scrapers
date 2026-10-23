@@ -428,3 +428,217 @@ test('Max desktop keeps purchase before settlement validation on written calenda
   });
   expect(new MaxDesktopError('transactionDates', 200).stage).toBe('transactionDates');
 });
+
+const compatibilityFields = [
+  'purchaseDate',
+  'paymentDate',
+  'actualPaymentAmount',
+  'paymentCurrency',
+  'originalCurrency',
+  'originalAmount',
+  'shortCardNumber',
+  'planName',
+  'planTypeId',
+  'comments',
+  'merchantName',
+  'dealData',
+  'arn',
+] as const;
+
+async function compatibilityFailure(rows: unknown[]) {
+  try {
+    await fixture([{ result: { transactions: rows } }]).scraper.fetchDesktopTransactions(limits);
+  } catch (error) {
+    if (error instanceof MaxDesktopError) return error;
+  }
+  throw new Error('Expected synthetic compatibility failure');
+}
+
+test('Max desktop reports every consumed field across the complete month before its first invalid row', async () => {
+  const canary = 'PRIVATE_SYNTHETIC_CANARY_NOT_FOR_DIAGNOSTICS';
+  const error = await compatibilityFailure([
+    { ...row, actualPaymentAmount: 12.34, comments: '', privateUnknownKey: canary },
+    {
+      ...row,
+      purchaseDate: '2026-09-21T00:00:00.0000000',
+      paymentDate: null,
+      actualPaymentAmount: '45.67',
+      paymentCurrency: '376',
+      originalCurrency: null,
+      originalAmount: '45.67',
+      shortCardNumber: 1234,
+      planName: true,
+      planTypeId: '5',
+      comments: null,
+      merchantName: { canary },
+      dealData: { arn: 9876, canary },
+    },
+    { planName: '', purchaseDate: false, actualPaymentAmount: false, comments: canary },
+    { planName: null, paymentCurrency: false },
+  ]);
+  expect(error.diagnostic).toEqual({
+    stage: 'transactionAmounts',
+    reason: 'UNAVAILABLE',
+    httpStatus: 200,
+    compatibility: [
+      { field: 'purchaseDate', kinds: ['localTimestamp', 'zonedTimestamp'] },
+      { field: 'paymentDate', kinds: ['null', 'zonedTimestamp'] },
+      { field: 'actualPaymentAmount', kinds: ['decimalNumber', 'decimalString'] },
+      { field: 'paymentCurrency', kinds: ['integerString', 'safeInteger'] },
+      { field: 'originalCurrency', kinds: ['null', 'text'] },
+      { field: 'originalAmount', kinds: ['decimalNumber', 'decimalString'] },
+      { field: 'shortCardNumber', kinds: ['integerString', 'safeInteger'] },
+      { field: 'planName', kinds: ['boolean', 'text'] },
+      { field: 'planTypeId', kinds: ['integerString', 'safeInteger'] },
+      { field: 'comments', kinds: ['emptyString', 'null'] },
+      { field: 'merchantName', kinds: ['object', 'text'] },
+      { field: 'dealData', kinds: ['object'] },
+      { field: 'arn', kinds: ['safeInteger', 'text'] },
+    ],
+  });
+  const encoded = JSON.stringify(error);
+  expect(encoded).not.toMatch(
+    /PRIVATE_SYNTHETIC|privateUnknownKey|Synthetic shop|1234|12\.34|45\.67|stable-reference|9876|376|canary/,
+  );
+  expect(error).not.toHaveProperty('cause');
+  expect(encoded.length).toBeLessThan(8192);
+});
+
+test('Max desktop compatibility types remain finite, deduplicated and independent of input values or row order', async () => {
+  const types = [
+    undefined,
+    null,
+    false,
+    7,
+    12.34,
+    Infinity,
+    Number.MAX_SAFE_INTEGER + 1,
+    '123',
+    '12.34',
+    '',
+    'PRIVATE_SYNTHETIC_TEXT',
+    {},
+    [],
+    Symbol('PRIVATE_SYNTHETIC_SYMBOL'),
+  ];
+  const rows = types.map(comments => ({ ...row, actualPaymentAmount: 12.34, comments }));
+  const forward = await compatibilityFailure(rows);
+  const reverse = await compatibilityFailure([...rows].reverse());
+  expect(forward.diagnostic.compatibility).toEqual(reverse.diagnostic.compatibility);
+  expect(forward.diagnostic.compatibility?.find(entry => entry.field === 'comments')?.kinds).toEqual([
+    'array',
+    'boolean',
+    'decimalNumber',
+    'decimalString',
+    'emptyString',
+    'integerString',
+    'missing',
+    'null',
+    'object',
+    'safeInteger',
+    'text',
+    'unsafeNumber',
+    'unsupported',
+  ]);
+  expect(JSON.stringify(forward)).not.toMatch(/PRIVATE_SYNTHETIC|12\.34|123|9007199254740992/);
+
+  const dates = await compatibilityFailure([
+    { ...row, purchaseDate: '2026-09-20', paymentDate: '2026-10-02T00:00:00.1234567', actualPaymentAmount: 12.34 },
+    { ...row, purchaseDate: '2026-02-30', paymentDate: '2026-10-02T24:00:00' },
+    { planName: 'PRIVATE_SYNTHETIC_PLAN', dealData: [] },
+  ]);
+  expect(dates.diagnostic.compatibility?.find(entry => entry.field === 'purchaseDate')?.kinds).toEqual([
+    'date',
+    'missing',
+    'text',
+  ]);
+  expect(dates.diagnostic.compatibility?.find(entry => entry.field === 'paymentDate')?.kinds).toEqual([
+    'localTimestamp',
+    'missing',
+    'text',
+  ]);
+  expect(dates.diagnostic.compatibility?.find(entry => entry.field === 'dealData')?.kinds).toEqual(['array', 'object']);
+  expect(dates.diagnostic.compatibility?.find(entry => entry.field === 'arn')?.kinds).toEqual(['missing', 'text']);
+});
+
+test('Max desktop includes safe aggregate on malformed rows and card limits, with no eligible rows exposing empty kinds', async () => {
+  const malformed = await compatibilityFailure([null, row]);
+  expect(malformed.stage).toBe('transactionsValidation');
+  expect(malformed.diagnostic.compatibility?.map(entry => entry.field)).toEqual(compatibilityFields);
+  expect(malformed.diagnostic.compatibility?.every(entry => entry.kinds.length === 1)).toBe(true);
+  const empty = await compatibilityFailure([null, { planName: '' }]);
+  expect(empty.diagnostic.compatibility).toEqual(compatibilityFields.map(field => ({ field, kinds: [] })));
+  const { scraper } = fixture([{ result: { transactions: [row, { ...row, shortCardNumber: '5678' }] } }]);
+  await expect(scraper.fetchDesktopTransactions({ ...limits, maxAccounts: 1 })).rejects.toMatchObject({
+    diagnostic: { stage: 'transactionsValidation', compatibility: malformed.diagnostic.compatibility },
+  });
+});
+
+test('Max desktop sanitizes and freezes a copied compatibility profile and omits it from request/response errors', () => {
+  const valid = compatibilityFields.map(field => ({ field, kinds: ['text'] }));
+  const error = new MaxDesktopError('transactionAmounts', 200, valid);
+  expect(error.diagnostic.compatibility).toEqual(valid);
+  expect(Object.isFrozen(error.diagnostic.compatibility)).toBe(true);
+  expect(Object.isFrozen(error.diagnostic.compatibility![0])).toBe(true);
+  expect(Object.isFrozen(error.diagnostic.compatibility![0].kinds)).toBe(true);
+  valid[0].kinds[0] = 'PRIVATE_MUTATION_CANARY';
+  expect(error.diagnostic.compatibility![0].kinds).toEqual(['text']);
+  const profile = compatibilityFields.map(field => ({ field, kinds: ['text'] }));
+  for (const malformed of [
+    null,
+    {},
+    [],
+    profile.slice(1),
+    [...profile, profile[0]],
+    [...profile].reverse(),
+    profile.map((entry, index) => (index ? entry : { ...entry, field: 'PRIVATE_FIELD_CANARY' })),
+    profile.map((entry, index) => (index ? entry : { ...entry, kinds: ['PRIVATE_KIND_CANARY'] })),
+    profile.map((entry, index) => (index ? entry : { ...entry, kinds: ['text', 'text'] })),
+    profile.map((entry, index) => (index ? entry : { ...entry, kinds: ['text', 'null'] })),
+    profile.map((entry, index) => (index ? entry : { ...entry, kinds: 'text' })),
+    profile.map((entry, index) => (index ? entry : { ...entry, value: 'PRIVATE_VALUE_CANARY' })),
+    profile.map((entry, index) =>
+      index
+        ? entry
+        : {
+            ...entry,
+            get kinds() {
+              throw new Error('PRIVATE_GETTER_CANARY');
+            },
+          },
+    ),
+  ]) {
+    const sanitized = new MaxDesktopError('transactionAmounts', 200, malformed);
+    expect(sanitized.diagnostic).not.toHaveProperty('compatibility');
+    expect(JSON.stringify(sanitized)).not.toMatch(/PRIVATE_/);
+  }
+  for (const stage of ['transactionsRequest', 'transactionsResponse'] as const) {
+    expect(new MaxDesktopError(stage, 200, profile).diagnostic).not.toHaveProperty('compatibility');
+  }
+  expect(new MaxDesktopError('transactionAmounts', null, profile).diagnostic).not.toHaveProperty('compatibility');
+});
+
+test('Max desktop compatibility diagnostics stay within the failure budget at the maximum finite profile size', () => {
+  const kinds = [
+    'array',
+    'boolean',
+    'date',
+    'decimalNumber',
+    'decimalString',
+    'emptyString',
+    'integerString',
+    'localTimestamp',
+    'missing',
+    'null',
+    'object',
+    'safeInteger',
+    'text',
+    'unsafeNumber',
+    'unsupported',
+    'zonedTimestamp',
+  ];
+  const maximum = compatibilityFields.map(field => ({ field, kinds }));
+  const error = new MaxDesktopError('transactionsValidation', 200, maximum);
+  expect(error.diagnostic.compatibility).toHaveLength(13);
+  expect(JSON.stringify(error).length).toBeLessThan(8192);
+});
