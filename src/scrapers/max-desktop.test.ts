@@ -162,3 +162,32 @@ test('Max desktop confines fetch to exact authenticated origin, JSON responses, 
     else Reflect.deleteProperty(globalThis, 'location');
   }
 });
+
+test('Max desktop skips documented summary rows while budgeting every raw row and rejecting invalid row shapes', async () => {
+  const summaries = [
+    {},
+    { planName: undefined },
+    { planName: null },
+    { planName: '' },
+    { planName: false },
+    { planName: 0 },
+  ];
+  const { scraper } = fixture([{ result: { transactions: [summaries[0], row, ...summaries.slice(1)] } }]);
+  const result = await scraper.fetchDesktopTransactions(limits);
+  expect(result.accounts).toHaveLength(1);
+  expect(result.accounts[0].txns).toHaveLength(1);
+  expect(result.accounts[0].txns[0].identifier).toBe('stable-reference');
+
+  const bounded = fixture([{ result: { transactions: [row, {}] } }]);
+  await expect(bounded.scraper.fetchDesktopTransactions({ ...limits, maxRows: 1 })).rejects.toThrow(
+    'PROVIDER_UNAVAILABLE',
+  );
+  const cumulative = fixture([{ result: { transactions: [{}] } }, { result: { transactions: [{}, row] } }]);
+  await expect(
+    cumulative.scraper.fetchDesktopTransactions({ ...limits, to: '2026-11-01', maxRows: 2 }),
+  ).rejects.toThrow('PROVIDER_UNAVAILABLE');
+  for (const invalid of [null, [], '', 0, false]) {
+    const invalidRows = fixture([{ result: { transactions: [invalid, row] } }]);
+    await expect(invalidRows.scraper.fetchDesktopTransactions(limits)).rejects.toThrow('PROVIDER_UNAVAILABLE');
+  }
+});

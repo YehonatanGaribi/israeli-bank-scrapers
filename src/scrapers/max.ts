@@ -568,6 +568,10 @@ export class MaxScraper extends BaseScraperWithBrowser<ScraperSpecificCredential
         )
           throw new Error('PROVIDER_UNAVAILABLE');
         for (const raw of envelope.transactions) {
+          if (!raw || typeof raw !== 'object' || Array.isArray(raw)) throw new Error('PROVIDER_UNAVAILABLE');
+          // The ordinary Max parser skips summary rows without a plan type.
+          // They still count toward the raw response budget above.
+          if (!raw.planName) continue;
           const { accountNumber, transaction } = desktopTransaction(raw);
           if (!accounts.has(accountNumber)) accounts.set(accountNumber, []);
           if (accounts.size > limits.maxAccounts) throw new Error('PROVIDER_UNAVAILABLE');
