@@ -178,3 +178,116 @@ test('failure screenshot option cannot capture a banking page in this fork', asy
   await browser.terminate(false);
   expect(screenshot).not.toHaveBeenCalled();
 });
+
+test('desktop preparation owns the anonymous request and its private token is consumed once by login', async () => {
+  const f = fixture();
+  const scraper = new OneZeroScraper(options, f.runtime);
+  expect(await scraper.prepareDesktopConnection()).toBeUndefined();
+  expect(f.calls).toEqual([
+    { operation: 'deviceToken', body: { extClientId: 'mobile', os: 'Android' }, authorization: undefined },
+  ]);
+  await expect(scraper.login(credentials)).resolves.toEqual({ success: true });
+  expect(f.calls.map(call => call.operation)).toEqual([
+    'deviceToken',
+    'prepareOtp',
+    'verifyOtp',
+    'idToken',
+    'sessionToken',
+  ]);
+  expect(f.calls[1].body.deviceToken).toBe(`deviceToken_${secret}`);
+  await expect(scraper.login(credentials)).resolves.toEqual({ success: true });
+  expect(f.calls.filter(call => call.operation === 'deviceToken')).toHaveLength(2);
+  scraper.dispose();
+  const fresh = fixture();
+  const next = new OneZeroScraper(options, fresh.runtime);
+  await next.prepareDesktopConnection();
+  expect(fresh.calls.map(call => call.operation)).toEqual(['deviceToken']);
+  next.dispose();
+});
+
+test('preparation failures are fixed, require a runtime, and never trigger OTP', async () => {
+  await expect(new OneZeroScraper(options).prepareDesktopConnection()).rejects.toThrow('PROVIDER_UNAVAILABLE');
+  for (const token of ['', '\r\n', 'x'.repeat(16_385), null]) {
+    const calls: OneZeroOperation[] = [];
+    const scraper = new OneZeroScraper(options, {
+      signal: new AbortController().signal,
+      request: async operation => {
+        calls.push(operation);
+        return { resultData: { deviceToken: token } };
+      },
+    });
+    await expect(scraper.prepareDesktopConnection()).rejects.toThrow('PROVIDER_UNAVAILABLE');
+    expect(calls).toEqual(['deviceToken']);
+    scraper.dispose();
+  }
+  const request = jest.fn(async () => {
+    throw new Error(secret);
+  });
+  const scraper = new OneZeroScraper(options, { signal: new AbortController().signal, request });
+  await expect(scraper.prepareDesktopConnection()).rejects.toThrow(/^PROVIDER_UNAVAILABLE$/);
+  expect(request).toHaveBeenCalledTimes(1);
+  scraper.dispose();
+});
+
+test('cancel, dispose and overlapping preparation cannot resurrect a late device token', async () => {
+  for (const interrupt of ['cancel', 'dispose', 'prepare', 'login'] as const) {
+    const f = fixture();
+    const original = f.runtime.request.bind(f.runtime);
+    let release!: () => void;
+    let started!: () => void;
+    const ready = new Promise<void>(resolve => {
+      started = resolve;
+    });
+    const blocked = new Promise<void>(resolve => {
+      release = resolve;
+    });
+    let deviceRequests = 0;
+    f.runtime.request = async (operation, body, authorization, signal) => {
+      if (operation === 'deviceToken' && ++deviceRequests === 1) {
+        started();
+        await blocked;
+      }
+      return original(operation, body, authorization, signal);
+    };
+    const scraper = new OneZeroScraper(options, f.runtime);
+    const pending = scraper.prepareDesktopConnection();
+    const rejected = expect(pending).rejects.toThrow('PROVIDER_UNAVAILABLE');
+    await ready;
+    if (interrupt === 'cancel') f.signal.abort();
+    else if (interrupt === 'dispose') scraper.dispose();
+    else if (interrupt === 'prepare')
+      await expect(scraper.prepareDesktopConnection()).rejects.toThrow('PROVIDER_UNAVAILABLE');
+    else await expect(scraper.login(credentials)).rejects.toThrow('PROVIDER_UNAVAILABLE');
+    release();
+    await rejected;
+    expect(f.calls.map(call => call.operation)).toEqual(['deviceToken']);
+    if (interrupt === 'prepare' || interrupt === 'login') {
+      await expect(scraper.login(credentials)).resolves.toEqual({ success: true });
+      expect(deviceRequests).toBe(2);
+      expect(f.calls.map(call => call.operation)).toEqual([
+        'deviceToken',
+        'deviceToken',
+        'prepareOtp',
+        'verifyOtp',
+        'idToken',
+        'sessionToken',
+      ]);
+    } else {
+      await expect(scraper.login(credentials)).rejects.toThrow('PROVIDER_UNAVAILABLE');
+      expect(deviceRequests).toBe(1);
+    }
+    scraper.dispose();
+  }
+});
+
+test('failed login clears an unused prepared token before a later attempt', async () => {
+  const f = fixture();
+  const scraper = new OneZeroScraper(options, f.runtime);
+  await scraper.prepareDesktopConnection();
+  await expect(
+    scraper.login({ email: credentials.email, password: secret, otpLongTermToken: secret }),
+  ).resolves.toMatchObject({ success: false });
+  await expect(scraper.login(credentials)).resolves.toEqual({ success: true });
+  expect(f.calls.filter(call => call.operation === 'deviceToken')).toHaveLength(2);
+  scraper.dispose();
+});

@@ -146,11 +146,56 @@ export default class OneZeroScraper extends BaseScraper<ScraperSpecificCredentia
 
   private disposed = false;
 
+  private preparedDeviceToken?: string;
+
+  private preparationGeneration = 0;
+
+  private preparing = false;
+
+  private authenticating = false;
+
+  private triggering = false;
+
   constructor(
     options: ScraperOptions,
     private readonly runtime?: OneZeroRuntime,
   ) {
     super(options);
+  }
+
+  private clearPreparedConnection() {
+    this.preparationGeneration++;
+    this.preparedDeviceToken = undefined;
+  }
+
+  /** Anonymous worker-only availability check before collecting login fields.
+   * The device token never leaves this instance and is consumed by one OTP flow.
+   */
+  async prepareDesktopConnection(): Promise<void> {
+    if (
+      !this.runtime ||
+      this.disposed ||
+      this.runtime.signal.aborted ||
+      this.preparing ||
+      this.authenticating ||
+      this.triggering ||
+      this.preparedDeviceToken !== undefined
+    ) {
+      this.clearPreparedConnection();
+      throw invalid();
+    }
+    const generation = ++this.preparationGeneration;
+    this.preparing = true;
+    try {
+      const response = await this.post('deviceToken', { extClientId: 'mobile', os: 'Android' });
+      if (this.disposed || this.runtime.signal.aborted || generation !== this.preparationGeneration) throw invalid();
+      this.preparedDeviceToken = response.resultData.deviceToken;
+    } catch {
+      this.clearPreparedConnection();
+      throw invalid();
+    } finally {
+      this.preparing = false;
+    }
   }
 
   private async post(operation: OneZeroOperation, body: Record<string, unknown>, authorization?: string): Promise<any> {
@@ -201,39 +246,47 @@ export default class OneZeroScraper extends BaseScraper<ScraperSpecificCredentia
   }
 
   async triggerTwoFactorAuth(phoneNumber: string): Promise<ScraperTwoFactorAuthTriggerResult> {
-    if (!/^\+[1-9]\d{7,14}$/.test(phoneNumber)) {
-      return createGenericError(
-        'A full international phone number starting with + and a three digit country code is required',
-      );
+    if (this.disposed || this.runtime?.signal.aborted || this.preparing || this.triggering) {
+      this.clearPreparedConnection();
+      throw invalid();
     }
+    this.triggering = true;
+    try {
+      if (!/^\+[1-9]\d{7,14}$/.test(phoneNumber)) {
+        return createGenericError(
+          'A full international phone number starting with + and a three digit country code is required',
+        );
+      }
 
-    debug('Fetching device token');
-    const deviceTokenResponse = await this.post('deviceToken', {
-      extClientId: 'mobile',
-      os: 'Android',
-    });
+      let deviceToken = this.preparedDeviceToken;
+      this.clearPreparedConnection();
+      if (deviceToken === undefined) {
+        debug('Fetching device token');
+        const deviceTokenResponse = await this.post('deviceToken', { extClientId: 'mobile', os: 'Android' });
+        deviceToken = deviceTokenResponse.resultData.deviceToken;
+      }
 
-    const {
-      resultData: { deviceToken },
-    } = deviceTokenResponse;
+      debug('Sending fresh OTP');
 
-    debug('Sending fresh OTP');
+      const otpPrepareResponse = await this.post('prepareOtp', {
+        factorValue: phoneNumber,
+        deviceToken,
+        otpChannel: 'SMS_OTP',
+      });
 
-    const otpPrepareResponse = await this.post('prepareOtp', {
-      factorValue: phoneNumber,
-      deviceToken,
-      otpChannel: 'SMS_OTP',
-    });
+      const {
+        resultData: { otpContext },
+      } = otpPrepareResponse;
 
-    const {
-      resultData: { otpContext },
-    } = otpPrepareResponse;
+      this.otpContext = otpContext;
 
-    this.otpContext = otpContext;
-
-    return {
-      success: true,
-    };
+      return {
+        success: true,
+      };
+    } finally {
+      this.preparedDeviceToken = undefined;
+      this.triggering = false;
+    }
   }
 
   public getLongTermTwoFactorToken(_otpCode: string): Promise<ScraperGetLongTermTwoFactorTokenResult> {
@@ -297,42 +350,57 @@ export default class OneZeroScraper extends BaseScraper<ScraperSpecificCredentia
   }
 
   async login(credentials: ScraperSpecificCredentials): Promise<ScraperLoginResult> {
-    this.accessToken = undefined;
-    this.otpContext = undefined;
-    if (this.disposed || this.runtime?.signal.aborted) throw invalid();
-    const otpTokenResult = await this.resolveOtpToken(credentials);
-    if (!otpTokenResult.success) {
-      return otpTokenResult;
+    if (this.disposed || this.runtime?.signal.aborted || this.preparing || this.authenticating || this.triggering) {
+      this.clearPreparedConnection();
+      throw invalid();
     }
+    this.authenticating = true;
+    let success = false;
+    try {
+      this.accessToken = undefined;
+      this.otpContext = undefined;
+      const otpTokenResult = await this.resolveOtpToken(credentials);
+      if (!otpTokenResult.success) {
+        return otpTokenResult;
+      }
 
-    debug('Requesting id token');
-    const getIdTokenResponse = await this.post('idToken', {
-      otpSmsToken: otpTokenResult.longTermTwoFactorAuthToken,
-      email: credentials.email,
-      pass: credentials.password,
-      pinCode: '',
-    });
+      debug('Requesting id token');
+      const getIdTokenResponse = await this.post('idToken', {
+        otpSmsToken: otpTokenResult.longTermTwoFactorAuthToken,
+        email: credentials.email,
+        pass: credentials.password,
+        pinCode: '',
+      });
 
-    const {
-      resultData: { idToken },
-    } = getIdTokenResponse;
+      const {
+        resultData: { idToken },
+      } = getIdTokenResponse;
 
-    debug('Requesting session token');
+      debug('Requesting session token');
 
-    const getSessionTokenResponse = await this.post('sessionToken', {
-      idToken,
-      pass: credentials.password,
-    });
+      const getSessionTokenResponse = await this.post('sessionToken', {
+        idToken,
+        pass: credentials.password,
+      });
 
-    const {
-      resultData: { accessToken },
-    } = getSessionTokenResponse;
+      const {
+        resultData: { accessToken },
+      } = getSessionTokenResponse;
 
-    this.accessToken = accessToken;
+      this.accessToken = accessToken;
+      success = true;
 
-    return {
-      success: true,
-    };
+      return {
+        success: true,
+      };
+    } finally {
+      this.clearPreparedConnection();
+      if (!success) {
+        this.otpContext = undefined;
+        this.accessToken = undefined;
+      }
+      this.authenticating = false;
+    }
   }
 
   private async fetchPortfolioMovements(portfolio: Portfolio, startDate: Date): Promise<TransactionsAccount> {
@@ -528,6 +596,7 @@ export default class OneZeroScraper extends BaseScraper<ScraperSpecificCredentia
 
   dispose() {
     this.disposed = true;
+    this.clearPreparedConnection();
     this.otpContext = undefined;
     this.accessToken = undefined;
   }
