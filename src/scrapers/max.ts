@@ -466,7 +466,7 @@ function desktopResponse(value: unknown): unknown {
           response.httpStatus !== 200))) ||
       (response.stage === 'transactionsResponse' && response.httpStatus === 200))
   )
-    throw new MaxDesktopError(response.stage, response.httpStatus);
+    throw new MaxDesktopError(response.stage, typeof response.httpStatus === 'number' ? response.httpStatus : null);
   throw new MaxDesktopError('transactionsResponse');
 }
 
