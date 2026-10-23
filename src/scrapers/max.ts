@@ -396,7 +396,193 @@ function createLoginFields(credentials: ScraperSpecificCredentials) {
 
 type ScraperSpecificCredentials = { username: string; password: string };
 
-class MaxScraper extends BaseScraperWithBrowser<ScraperSpecificCredentials> {
+export interface MaxDesktopTransactionLimits {
+  from: string;
+  to: string;
+  maxAccounts: number;
+  maxRows: number;
+}
+
+function desktopDay(value: unknown): string | undefined {
+  if (
+    typeof value !== 'string' ||
+    !/^\d{4}-\d{2}-\d{2}(?:T(?:[01]\d|2[0-3]):[0-5]\d:[0-5]\d(?:\.\d{1,9})?(?:Z|[+-](?:[01]\d|2[0-3]):[0-5]\d))?$/.test(
+      value,
+    )
+  )
+    return undefined;
+  const day = value.slice(0, 10);
+  return new Date(`${day}T00:00:00Z`).toISOString().slice(0, 10) === day && Number.isFinite(Date.parse(value))
+    ? day
+    : undefined;
+}
+
+export function getMaxMinimumStartDate(): Date {
+  const now = moment.utc().subtract(4, 'years');
+  return now.startOf('day').toDate();
+}
+
+function desktopTransaction(value: unknown): { accountNumber: string; transaction: Transaction } {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) throw new Error('PROVIDER_UNAVAILABLE');
+  const row = value as ScrapedTransaction;
+  const purchaseDay = desktopDay(row.purchaseDate);
+  const pending = row.paymentDate == null;
+  const paymentDay = pending ? purchaseDay : desktopDay(row.paymentDate);
+  if (
+    !purchaseDay ||
+    !paymentDay ||
+    purchaseDay > paymentDay ||
+    typeof row.shortCardNumber !== 'string' ||
+    !/^\d{4}$/.test(row.shortCardNumber) ||
+    typeof row.actualPaymentAmount !== 'string' ||
+    !/^-?(?:0|[1-9]\d{0,13})(?:\.\d{1,2})?$/.test(row.actualPaymentAmount) ||
+    !Number.isFinite(row.originalAmount) ||
+    typeof row.originalCurrency !== 'string' ||
+    !/^[A-Z]{3}$/.test(row.originalCurrency) ||
+    typeof row.planName !== 'string' ||
+    row.planName.length > 200 ||
+    !Number.isSafeInteger(row.planTypeId) ||
+    typeof row.comments !== 'string' ||
+    row.comments.length > 1000 ||
+    typeof row.merchantName !== 'string' ||
+    row.merchantName.length > 4000 ||
+    !(row.paymentCurrency === null || row.paymentCurrency === undefined || Number.isSafeInteger(row.paymentCurrency))
+  )
+    throw new Error('PROVIDER_UNAVAILABLE');
+  const type = getTransactionType(row.planName, row.planTypeId);
+  const installments = type === TransactionTypes.Installments ? getInstallmentsInfo(row.comments) : undefined;
+  if (
+    type === TransactionTypes.Installments &&
+    (!installments || installments.number < 1 || installments.total > 1200 || installments.number > installments.total)
+  )
+    throw new Error('PROVIDER_UNAVAILABLE');
+  const arn = row.dealData?.arn;
+  if (arn !== undefined && (typeof arn !== 'string' || !/^[A-Za-z0-9_-]{1,200}$/.test(arn)))
+    throw new Error('PROVIDER_UNAVAILABLE');
+  return {
+    accountNumber: row.shortCardNumber,
+    transaction: {
+      type,
+      date: `${purchaseDay}T00:00:00.000Z`,
+      processedDate: `${paymentDay}T00:00:00.000Z`,
+      originalAmount: -row.originalAmount,
+      originalCurrency: row.originalCurrency,
+      chargedAmount: -Number(row.actualPaymentAmount),
+      chargedCurrency: getChargedCurrency(row.paymentCurrency),
+      description: row.merchantName.trim(),
+      // A billing date today or in the future does not establish settlement.
+      status:
+        pending || paymentDay >= moment.utc().format('YYYY-MM-DD')
+          ? TransactionStatuses.Pending
+          : TransactionStatuses.Completed,
+      ...(installments ? { installments } : {}),
+      ...(arn ? { identifier: installments ? `${arn}_${installments.number}` : arn } : {}),
+    },
+  };
+}
+
+export class MaxScraper extends BaseScraperWithBrowser<ScraperSpecificCredentials> {
+  /** Attach only the already scoped temporary page. The normal initializer adds
+   * request logging hooks and is deliberately unused by the desktop worker. */
+  initializeDesktopPage(page: Page): void {
+    this.page = page;
+  }
+
+  /** Manual login only; bounded billing months, no homepage, categories, balances,
+   * installment date rewriting, memo or raw response returned to the caller. */
+  async fetchDesktopTransactions(limits: MaxDesktopTransactionLimits) {
+    try {
+      if (
+        !limits ||
+        !desktopDay(limits.from) ||
+        limits.from.length !== 10 ||
+        !desktopDay(limits.to) ||
+        limits.to.length !== 10 ||
+        limits.from > limits.to ||
+        new Date(`${limits.from}T00:00:00Z`) < getMaxMinimumStartDate() ||
+        !Number.isSafeInteger(limits.maxAccounts) ||
+        limits.maxAccounts < 1 ||
+        limits.maxAccounts > 20 ||
+        !Number.isSafeInteger(limits.maxRows) ||
+        limits.maxRows < 1 ||
+        limits.maxRows > 5000
+      )
+        throw new Error('PROVIDER_UNAVAILABLE');
+      const first = moment.utc(limits.from).startOf('month'),
+        last = moment.utc(limits.to).startOf('month');
+      const count = last.diff(first, 'months') + 1;
+      if (count < 1 || count > 49) throw new Error('PROVIDER_UNAVAILABLE');
+      const accounts = new Map<string, Transaction[]>();
+      let scanned = 0;
+      for (let month = 0; month < count; month += 1) {
+        const data: unknown = await this.page.evaluate(
+          async (url, maxBytes) => {
+            try {
+              if (location.origin !== 'https://www.max.co.il' || location.pathname !== '/homepage/personal')
+                throw new Error();
+              const controller = new AbortController();
+              const timer = setTimeout(() => controller.abort(), 15000);
+              try {
+                const response = await fetch(url, {
+                  credentials: 'include',
+                  redirect: 'error',
+                  signal: controller.signal,
+                });
+                if (
+                  response.status !== 200 ||
+                  !/^application\/json(?:;|$)/i.test(response.headers.get('content-type') ?? '') ||
+                  !response.body
+                )
+                  throw new Error();
+                const reader = response.body.getReader();
+                const decoder = new TextDecoder();
+                let text = '',
+                  bytes = 0;
+                for (;;) {
+                  const chunk = await reader.read();
+                  if (chunk.done) break;
+                  bytes += chunk.value.byteLength;
+                  if (bytes > maxBytes) {
+                    await reader.cancel();
+                    throw new Error();
+                  }
+                  text += decoder.decode(chunk.value, { stream: true });
+                }
+                return JSON.parse(text + decoder.decode()) as unknown;
+              } finally {
+                clearTimeout(timer);
+              }
+            } catch {
+              throw new Error('PROVIDER_UNAVAILABLE');
+            }
+          },
+          getTransactionsUrl(first.clone().add(month, 'months')),
+          2_000_000,
+        );
+        if (!data || typeof data !== 'object' || Array.isArray(data)) throw new Error('PROVIDER_UNAVAILABLE');
+        const envelope = (data as ScrapedTransactionsResult).result;
+        if (
+          !envelope ||
+          !Array.isArray(envelope.transactions) ||
+          (scanned += envelope.transactions.length) > limits.maxRows
+        )
+          throw new Error('PROVIDER_UNAVAILABLE');
+        for (const raw of envelope.transactions) {
+          const { accountNumber, transaction } = desktopTransaction(raw);
+          if (!accounts.has(accountNumber)) accounts.set(accountNumber, []);
+          if (accounts.size > limits.maxAccounts) throw new Error('PROVIDER_UNAVAILABLE');
+          // Billing-month queries can include adjacent dates. Preserve the actual
+          // settlement date; never invoke fixInstallments or guess a charge date.
+          const day = transaction.processedDate.slice(0, 10);
+          if (day >= limits.from && day <= limits.to) accounts.get(accountNumber)!.push(transaction);
+        }
+      }
+      return { success: true, accounts: Array.from(accounts, ([accountNumber, txns]) => ({ accountNumber, txns })) };
+    } catch {
+      throw new Error('PROVIDER_UNAVAILABLE');
+    }
+  }
+
   getLoginOptions(credentials: ScraperSpecificCredentials): LoginOptions {
     return {
       loginUrl: LOGIN_URL,
