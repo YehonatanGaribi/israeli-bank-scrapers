@@ -1,6 +1,6 @@
 import moment from 'moment/moment';
 import { getDebug } from '../helpers/debug';
-import { fetchGraphql, fetchPost } from '../helpers/fetch';
+import { fetchOneZeroPost } from '../helpers/one-zero-https';
 import { getRawTransaction } from '../helpers/transactions';
 import {
   type Transaction as ScrapingTransaction,
@@ -158,7 +158,7 @@ export default class OneZeroScraper extends BaseScraper<ScraperSpecificCredentia
     try {
       const result = this.runtime
         ? await this.runtime.request(operation, body, authorization, this.runtime.signal)
-        : await fetchPost(ONE_ZERO_ENDPOINTS[operation], body, authorization ? { authorization } : {});
+        : await fetchOneZeroPost(ONE_ZERO_ENDPOINTS[operation], body, authorization);
       if (this.disposed || this.runtime?.signal.aborted) throw invalid();
       const tokenName = (
         {
@@ -345,8 +345,8 @@ export default class OneZeroScraper extends BaseScraper<ScraperSpecificCredentia
       debug('Fetching transactions');
       const {
         movements: { movements: newMovements, pagination },
-      }: { movements: { movements: Movement[]; pagination: QueryPagination } } = await fetchGraphql(
-        GRAPHQL_API_URL,
+      }: { movements: { movements: Movement[]; pagination: QueryPagination } } = await this.graph(
+        'movements',
         GET_MOVEMENTS,
         {
           portfolioId: portfolio.portfolioId,
@@ -357,7 +357,6 @@ export default class OneZeroScraper extends BaseScraper<ScraperSpecificCredentia
             limit: 50,
           },
         },
-        { authorization: `Bearer ${this.accessToken}` },
       );
 
       movements.unshift(...newMovements);
@@ -436,12 +435,7 @@ export default class OneZeroScraper extends BaseScraper<ScraperSpecificCredentia
     const startMoment = moment.max(defaultStartMoment, moment(startDate));
 
     debug('Fetching account list');
-    const result = await fetchGraphql<{ customer: Customer[] }>(
-      GRAPHQL_API_URL,
-      GET_CUSTOMER,
-      {},
-      { authorization: `Bearer ${this.accessToken}` },
-    );
+    const result: { customer: Customer[] } = await this.graph('customer', GET_CUSTOMER, {});
     const portfolios = result.customer.flatMap(customer => customer.portfolios || []);
 
     return {
