@@ -457,7 +457,7 @@ async function compatibilityFailure(rows: unknown[]) {
 test('Max desktop reports every consumed field across the complete month before its first invalid row', async () => {
   const canary = 'PRIVATE_SYNTHETIC_CANARY_NOT_FOR_DIAGNOSTICS';
   const error = await compatibilityFailure([
-    { ...row, actualPaymentAmount: 12.34, comments: '', privateUnknownKey: canary },
+    { ...row, actualPaymentAmount: 12.345, comments: '', privateUnknownKey: canary },
     {
       ...row,
       purchaseDate: '2026-09-21T00:00:00.0000000',
@@ -521,7 +521,7 @@ test('Max desktop compatibility types remain finite, deduplicated and independen
     [],
     Symbol('PRIVATE_SYNTHETIC_SYMBOL'),
   ];
-  const rows = types.map(comments => ({ ...row, actualPaymentAmount: 12.34, comments }));
+  const rows = types.map(comments => ({ ...row, actualPaymentAmount: 12.345, comments }));
   const forward = await compatibilityFailure(rows);
   const reverse = await compatibilityFailure([...rows].reverse());
   expect(forward.diagnostic.compatibility).toEqual(reverse.diagnostic.compatibility);
@@ -641,4 +641,152 @@ test('Max desktop compatibility diagnostics stay within the failure budget at th
   const error = new MaxDesktopError('transactionsValidation', 200, maximum);
   expect(error.diagnostic.compatibility).toHaveLength(13);
   expect(JSON.stringify(error).length).toBeLessThan(8192);
+});
+
+test('Max desktop imports the whole numeric-amount profile with local dates, refunds and installment identifiers', async () => {
+  const liveProfileRow = {
+    ...row,
+    purchaseDate: '2026-09-20T00:00:00.0000000',
+    paymentDate: '2026-10-02T00:00:00',
+    actualPaymentAmount: 12.34,
+    comments: '',
+    dealData: { arn: '000123456789' },
+  };
+  const { scraper } = fixture([
+    {
+      result: {
+        transactions: [
+          liveProfileRow,
+          {
+            ...liveProfileRow,
+            actualPaymentAmount: -5,
+            originalAmount: -5,
+            comments: 'Synthetic refund',
+            dealData: { arn: '000123456790' },
+          },
+          {
+            ...liveProfileRow,
+            actualPaymentAmount: 23.45,
+            originalAmount: 70.35,
+            planName: 'תשלומים',
+            planTypeId: 2,
+            comments: 'תשלום 2 מתוך 3',
+            dealData: { arn: '000123456791' },
+          },
+        ],
+      },
+    },
+  ]);
+  const result = await scraper.fetchDesktopTransactions(limits);
+  expect(result.accounts[0].txns).toEqual([
+    {
+      type: 'normal',
+      date: '2026-09-20T00:00:00.000Z',
+      processedDate: '2026-10-02T00:00:00.000Z',
+      originalAmount: -12.34,
+      originalCurrency: 'ILS',
+      chargedAmount: -12.34,
+      chargedCurrency: 'ILS',
+      description: 'Synthetic shop',
+      status: 'completed',
+      identifier: '000123456789',
+    },
+    {
+      type: 'normal',
+      date: '2026-09-20T00:00:00.000Z',
+      processedDate: '2026-10-02T00:00:00.000Z',
+      originalAmount: 5,
+      originalCurrency: 'ILS',
+      chargedAmount: 5,
+      chargedCurrency: 'ILS',
+      description: 'Synthetic shop',
+      status: 'completed',
+      identifier: '000123456790',
+    },
+    {
+      type: 'installments',
+      date: '2026-09-20T00:00:00.000Z',
+      processedDate: '2026-10-02T00:00:00.000Z',
+      originalAmount: -70.35,
+      originalCurrency: 'ILS',
+      chargedAmount: -23.45,
+      chargedCurrency: 'ILS',
+      description: 'Synthetic shop',
+      status: 'completed',
+      installments: { number: 2, total: 3 },
+      identifier: '000123456791_2',
+    },
+  ]);
+  expect(JSON.stringify(result)).not.toMatch(/Secret memo|Synthetic refund|rawTransaction|comments|compatibility/);
+});
+
+test.each([
+  [0, -0],
+  [-0, 0],
+  [5, -5],
+  [-5, 5],
+  [12.34, -12.34],
+  [-12.34, 12.34],
+  [0.29, -0.29],
+  [0.01, -0.01],
+  [1.1, -1.1],
+  [90071992547409, -90071992547409],
+  ['0', -0],
+  ['-0', 0],
+  ['12.34', -12.34],
+  ['-12.34', 12.34],
+  ['0.01', -0.01],
+  ['1.10', -1.1],
+  ['90071992547409', -90071992547409],
+  ['90071992547409.90', -90071992547409.9],
+] as const)(
+  'Max desktop preserves exact supported numeric/string amount signs: %s',
+  async (actualPaymentAmount, expected) => {
+    const { scraper } = fixture([{ result: { transactions: [{ ...row, actualPaymentAmount }] } }]);
+    const result = await scraper.fetchDesktopTransactions(limits);
+    expect(result.accounts[0].txns[0].chargedAmount).toBe(expected);
+  },
+);
+
+test.each([
+  NaN,
+  Infinity,
+  -Infinity,
+  Number.MAX_SAFE_INTEGER + 1,
+  12.345,
+  1.005,
+  0.1 + 0.2,
+  1e-7,
+  '90071992547409.91',
+  '-90071992547409.91',
+  '90071992547409.92',
+  '99999999999999.99',
+  '100000000000000',
+  '12.345',
+  '1e2',
+  '1E2',
+  '1e-2',
+  '+12.34',
+  '012.34',
+  '.29',
+  '12.',
+  '12,34',
+  '1,234.56',
+  ' 12.34',
+  '12.34 ',
+  '12.34\n',
+  '',
+  'NaN',
+  'Infinity',
+  undefined,
+  null,
+  true,
+  false,
+  {},
+  [],
+  new Number(12.34),
+])('Max desktop rejects noncanonical, imprecise or unsafe amounts without rounding: %s', async actualPaymentAmount => {
+  const error = await compatibilityFailure([{ ...row, actualPaymentAmount }]);
+  expect(error.diagnostic).toMatchObject({ stage: 'transactionAmounts', reason: 'UNAVAILABLE', httpStatus: 200 });
+  expect(error.message).toBe('PROVIDER_UNAVAILABLE');
 });

@@ -28,7 +28,7 @@ export interface ScrapedTransaction {
   shortCardNumber: string;
   paymentDate?: string;
   purchaseDate: string;
-  actualPaymentAmount: string;
+  actualPaymentAmount: string | number;
   paymentCurrency: number | null;
   originalCurrency: string;
   originalAmount: number;
@@ -266,7 +266,7 @@ function mapTransaction(rawTransaction: ScrapedTransaction, options?: ScraperOpt
     processedDate,
     originalAmount: -rawTransaction.originalAmount,
     originalCurrency: rawTransaction.originalCurrency,
-    chargedAmount: -rawTransaction.actualPaymentAmount,
+    chargedAmount: -Number(rawTransaction.actualPaymentAmount),
     chargedCurrency: getChargedCurrency(rawTransaction.paymentCurrency),
     description: rawTransaction.merchantName.trim(),
     memo: getMemo(rawTransaction),
@@ -630,6 +630,26 @@ export function getMaxMinimumStartDate(): Date {
   return now.startOf('day').toDate();
 }
 
+function desktopAmountMinorUnits(value: string): bigint | undefined {
+  const match = /^(-?)(0|[1-9]\d{0,13})(?:\.(\d{1,2}))?$/.exec(value);
+  if (!match || match[0] !== value) return undefined;
+  const minorUnits = BigInt(match[2]) * 100n + BigInt((match[3] ?? '').padEnd(2, '0'));
+  return match[1] ? -minorUnits : minorUnits;
+}
+
+/** Validate decimal cents without floating-point multiplication or rounding.
+ * The numeric output must serialize back to the same exact minor units. */
+function desktopAmount(value: unknown): number | undefined {
+  const text =
+    typeof value === 'string' ? value : typeof value === 'number' && Number.isFinite(value) ? String(value) : undefined;
+  if (text === undefined) return undefined;
+  const minorUnits = desktopAmountMinorUnits(text);
+  const maximumMinorUnits = BigInt(Number.MAX_SAFE_INTEGER);
+  if (minorUnits === undefined || minorUnits < -maximumMinorUnits || minorUnits > maximumMinorUnits) return undefined;
+  const amount = typeof value === 'number' ? value : Number(text);
+  return desktopAmountMinorUnits(String(amount)) === minorUnits ? amount : undefined;
+}
+
 function desktopTransaction(value: unknown): { accountNumber: string; transaction: Transaction } {
   if (!value || typeof value !== 'object' || Array.isArray(value))
     throw new MaxDesktopError('transactionsValidation', 200);
@@ -640,9 +660,9 @@ function desktopTransaction(value: unknown): { accountNumber: string; transactio
   const paymentDay = pending ? purchaseDay : desktopDay(row.paymentDate);
   if (!paymentDay) throw new MaxDesktopError('transactionPaymentDate', 200);
   if (purchaseDay > paymentDay) throw new MaxDesktopError('transactionDateOrder', 200);
+  const chargedAmount = desktopAmount(row.actualPaymentAmount);
   if (
-    typeof row.actualPaymentAmount !== 'string' ||
-    !/^-?(?:0|[1-9]\d{0,13})(?:\.\d{1,2})?$/.test(row.actualPaymentAmount) ||
+    chargedAmount === undefined ||
     !Number.isFinite(row.originalAmount) ||
     typeof row.originalCurrency !== 'string' ||
     !/^[A-Z]{3}$/.test(row.originalCurrency) ||
@@ -684,7 +704,7 @@ function desktopTransaction(value: unknown): { accountNumber: string; transactio
       processedDate: `${paymentDay}T00:00:00.000Z`,
       originalAmount: -row.originalAmount,
       originalCurrency: row.originalCurrency,
-      chargedAmount: -Number(row.actualPaymentAmount),
+      chargedAmount: -chargedAmount,
       chargedCurrency: getChargedCurrency(row.paymentCurrency),
       description: row.merchantName.trim(),
       // A billing date today or in the future does not establish settlement.
