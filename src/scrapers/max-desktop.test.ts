@@ -1,7 +1,7 @@
 /* Synthetic browser methods deliberately perform no bank I/O. */
 import { type Page } from 'puppeteer';
 import { CompanyTypes } from '../definitions';
-import { MaxScraper } from './max';
+import { MaxDesktopError, MaxScraper, type MaxDesktopStage } from './max';
 
 const row = {
   shortCardNumber: '1234',
@@ -22,7 +22,7 @@ const row = {
 const limits = { from: '2026-10-01', to: '2026-10-22', maxAccounts: 20, maxRows: 5000 };
 function fixture(responses: unknown[] = [{ result: { transactions: [row] } }]) {
   const evaluate = jest.fn();
-  responses.forEach(response => evaluate.mockResolvedValueOnce(response));
+  responses.forEach(response => evaluate.mockResolvedValueOnce({ ok: true, httpStatus: 200, data: response }));
   const scraper = new MaxScraper({
     companyId: CompanyTypes.max,
     startDate: new Date('2026-10-01T00:00:00Z'),
@@ -138,23 +138,39 @@ test('Max desktop confines fetch to exact authenticated origin, JSON responses, 
       new Response('{"result":{"transactions":[]}}', { headers: { 'content-type': 'application/json' } }),
     );
     await expect(fetchInPage('https://onlinelcapi.max.co.il/test', 100)).resolves.toEqual({
-      result: { transactions: [] },
+      ok: true,
+      httpStatus: 200,
+      data: { result: { transactions: [] } },
     });
     expect(fetchSpy.mock.calls[0][1]).toMatchObject({ credentials: 'include', redirect: 'error' });
-    for (const response of [
-      new Response('private response', { status: 403 }),
-      new Response('{}', { headers: { 'content-type': 'text/html' } }),
-      new Response('private response body', { headers: { 'content-type': 'application/json' } }),
-    ]) {
+    for (const [response, stage, httpStatus] of [
+      [new Response('private response', { status: 403 }), 'transactionsRequest', 403],
+      [new Response('{}', { headers: { 'content-type': 'text/html' } }), 'transactionsResponse', 200],
+      [
+        new Response('private response body', { headers: { 'content-type': 'application/json' } }),
+        'transactionsResponse',
+        200,
+      ],
+    ] as const) {
       fetchSpy.mockResolvedValueOnce(response);
-      await expect(fetchInPage('https://onlinelcapi.max.co.il/test', 4)).rejects.toThrow(/^PROVIDER_UNAVAILABLE$/);
+      await expect(fetchInPage('https://onlinelcapi.max.co.il/test', 4)).resolves.toEqual({
+        ok: false,
+        stage,
+        reason: 'UNAVAILABLE',
+        httpStatus,
+      });
     }
     fetchSpy.mockClear();
     Object.defineProperty(globalThis, 'location', {
       configurable: true,
       value: { origin: 'https://evil.example', pathname: '/homepage/personal' },
     });
-    await expect(fetchInPage('https://onlinelcapi.max.co.il/test', 100)).rejects.toThrow(/^PROVIDER_UNAVAILABLE$/);
+    await expect(fetchInPage('https://onlinelcapi.max.co.il/test', 100)).resolves.toEqual({
+      ok: false,
+      stage: 'transactionsRequest',
+      reason: 'UNAVAILABLE',
+      httpStatus: null,
+    });
     expect(fetchSpy).not.toHaveBeenCalled();
   } finally {
     fetchSpy.mockRestore();
@@ -189,5 +205,145 @@ test('Max desktop skips documented summary rows while budgeting every raw row an
   for (const invalid of [null, [], '', 0, false]) {
     const invalidRows = fixture([{ result: { transactions: [invalid, row] } }]);
     await expect(invalidRows.scraper.fetchDesktopTransactions(limits)).rejects.toThrow('PROVIDER_UNAVAILABLE');
+  }
+});
+
+test.each([
+  [{ purchaseDate: 'private invalid date' }, 'transactionDates'],
+  [{ purchaseDate: '2026-99-99' }, 'transactionDates'],
+  [{ paymentDate: '2026-09-01' }, 'transactionDates'],
+  [{ actualPaymentAmount: 'private invalid amount' }, 'transactionAmounts'],
+  [{ originalAmount: Infinity }, 'transactionAmounts'],
+  [{ originalCurrency: 'private invalid currency' }, 'transactionAmounts'],
+  [{ shortCardNumber: 'private invalid card' }, 'transactionMetadata'],
+  [{ planName: 'private unknown plan', planTypeId: 99 }, 'transactionMetadata'],
+  [{ comments: null }, 'transactionMetadata'],
+  [{ planName: 'תשלומים', planTypeId: 2, comments: 'private invalid installments' }, 'transactionMetadata'],
+  [{ dealData: { arn: 'private invalid reference' } }, 'transactionReference'],
+] as const)(
+  'Max desktop classifies invalid transaction fields with only fixed diagnostics: %s',
+  async (patch, stage) => {
+    const { scraper } = fixture([{ result: { transactions: [{ ...row, ...patch }] } }]);
+    await expect(scraper.fetchDesktopTransactions(limits)).rejects.toMatchObject({
+      message: 'PROVIDER_UNAVAILABLE',
+      stage,
+      reason: 'UNAVAILABLE',
+      httpStatus: 200,
+      diagnostic: { stage, reason: 'UNAVAILABLE', httpStatus: 200 },
+    });
+    try {
+      await fixture([{ result: { transactions: [{ ...row, ...patch }] } }]).scraper.fetchDesktopTransactions(limits);
+    } catch (error) {
+      expect(error).toBeInstanceOf(MaxDesktopError);
+      expect(JSON.stringify(error)).not.toMatch(/private|Secret|Synthetic|stable-reference|1234/);
+      expect(error).not.toHaveProperty('cause');
+    }
+  },
+);
+
+test('Max desktop validates the untrusted browser diagnostic envelope without reflecting arbitrary fields', async () => {
+  for (const envelope of [
+    null,
+    [],
+    {},
+    { ok: true, httpStatus: '200', data: {} },
+    { ok: true, httpStatus: 200, data: {}, secret: 'private response' },
+    { ok: false, stage: 'private stage', reason: 'UNAVAILABLE', httpStatus: 503 },
+    { ok: false, stage: 'transactionsRequest', reason: 'private reason', httpStatus: 503 },
+    { ok: false, stage: 'transactionsRequest', reason: 'UNAVAILABLE', httpStatus: '503' },
+    { ok: false, stage: 'transactionsRequest', reason: 'UNAVAILABLE', httpStatus: 99 },
+    { ok: false, stage: 'transactionsRequest', reason: 'UNAVAILABLE', httpStatus: 600 },
+    { ok: false, stage: 'transactionsRequest', reason: 'UNAVAILABLE', httpStatus: 503.5 },
+    { ok: false, stage: 'transactionsRequest', reason: 'UNAVAILABLE', httpStatus: Infinity },
+    { ok: false, stage: 'transactionsResponse', reason: 'UNAVAILABLE', httpStatus: 503 },
+    { ok: false, stage: 'transactionsRequest', reason: 'UNAVAILABLE', httpStatus: 200 },
+    { ok: false, stage: 'transactionsRequest', reason: 'UNAVAILABLE', httpStatus: 503, cause: 'private response' },
+  ]) {
+    const { scraper, evaluate } = fixture();
+    evaluate.mockReset().mockResolvedValue(envelope);
+    await expect(scraper.fetchDesktopTransactions(limits)).rejects.toMatchObject({
+      message: 'PROVIDER_UNAVAILABLE',
+      diagnostic: { stage: 'transactionsResponse', reason: 'UNAVAILABLE', httpStatus: null },
+    });
+  }
+  for (const data of [null, [], {}, { result: [] }, { result: {} }, { result: { transactions: 'private payload' } }]) {
+    await expect(fixture([data]).scraper.fetchDesktopTransactions(limits)).rejects.toMatchObject({
+      diagnostic: { stage: 'transactionsResponse', reason: 'UNAVAILABLE', httpStatus: 200 },
+    });
+  }
+});
+
+test('Max desktop errors expose immutable finite diagnostics and no raw cause', () => {
+  const error = new MaxDesktopError('transactionsRequest', 503);
+  expect(error.message).toBe('PROVIDER_UNAVAILABLE');
+  expect(error.diagnostic).toEqual({ stage: 'transactionsRequest', reason: 'UNAVAILABLE', httpStatus: 503 });
+  expect(Object.isFrozen(error)).toBe(true);
+  expect(Object.isFrozen(error.diagnostic)).toBe(true);
+  for (const invalid of [NaN, Infinity, 503.5, 0, 600]) {
+    expect(new MaxDesktopError('transactionsRequest', invalid).httpStatus).toBeNull();
+  }
+  expect(new MaxDesktopError('private stage' as MaxDesktopStage).stage).toBe('transactionsValidation');
+});
+
+test('Max desktop executes the bounded browser fetch and preserves only actual HTTP statuses and fixed stages', async () => {
+  const priorLocation = Object.getOwnPropertyDescriptor(globalThis, 'location');
+  Object.defineProperty(globalThis, 'location', {
+    configurable: true,
+    value: { origin: 'https://www.max.co.il', pathname: '/homepage/personal' },
+  });
+  const fetchSpy = jest.spyOn(globalThis, 'fetch');
+  const { scraper, evaluate } = fixture();
+  evaluate
+    .mockReset()
+    .mockImplementation((fn: (url: string, maxBytes: number) => Promise<unknown>, url: string, maxBytes: number) =>
+      fn(url, maxBytes),
+    );
+  const expected = (stage: MaxDesktopStage, httpStatus: number | null) => ({
+    message: 'PROVIDER_UNAVAILABLE',
+    diagnostic: { stage, reason: 'UNAVAILABLE', httpStatus },
+  });
+  try {
+    const denied = new Response('private bank response containing credentials', { status: 503 });
+    const deniedReader = jest.spyOn(denied.body!, 'getReader');
+    fetchSpy.mockResolvedValueOnce(denied);
+    await expect(scraper.fetchDesktopTransactions(limits)).rejects.toMatchObject(expected('transactionsRequest', 503));
+    expect(deniedReader).not.toHaveBeenCalled();
+
+    fetchSpy.mockRejectedValueOnce(new Error('private network error with credentials'));
+    await expect(scraper.fetchDesktopTransactions(limits)).rejects.toMatchObject(expected('transactionsRequest', null));
+
+    for (const response of [
+      new Response('private html', { headers: { 'content-type': 'text/html' } }),
+      new Response('private invalid json containing credentials', { headers: { 'content-type': 'application/json' } }),
+      new Response(null, { headers: { 'content-type': 'application/json' } }),
+      new Response(
+        new ReadableStream({
+          start(controller) {
+            controller.error(new Error('private stream error'));
+          },
+        }),
+        { headers: { 'content-type': 'application/json' } },
+      ),
+      new Response(JSON.stringify({ private: 'invalid envelope' }), {
+        headers: { 'content-type': 'application/json' },
+      }),
+    ]) {
+      fetchSpy.mockResolvedValueOnce(response);
+      await expect(scraper.fetchDesktopTransactions(limits)).rejects.toMatchObject(
+        expected('transactionsResponse', 200),
+      );
+    }
+    fetchSpy.mockResolvedValueOnce(
+      new Response(JSON.stringify({ result: { transactions: [row] } }), {
+        headers: { 'content-type': 'application/json' },
+      }),
+    );
+    await expect(scraper.fetchDesktopTransactions(limits)).resolves.toMatchObject({ success: true });
+    evaluate.mockReset().mockRejectedValue(new Error('private page evaluation error with credentials'));
+    await expect(scraper.fetchDesktopTransactions(limits)).rejects.toMatchObject(expected('transactionsRequest', null));
+  } finally {
+    fetchSpy.mockRestore();
+    if (priorLocation) Object.defineProperty(globalThis, 'location', priorLocation);
+    else Reflect.deleteProperty(globalThis, 'location');
   }
 });

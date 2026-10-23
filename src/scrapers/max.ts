@@ -403,6 +403,73 @@ export interface MaxDesktopTransactionLimits {
   maxRows: number;
 }
 
+const MAX_DESKTOP_STAGES = [
+  'transactionsRequest',
+  'transactionsResponse',
+  'transactionsValidation',
+  'transactionDates',
+  'transactionAmounts',
+  'transactionMetadata',
+  'transactionReference',
+] as const;
+
+export type MaxDesktopStage =
+  | 'transactionsRequest'
+  | 'transactionsResponse'
+  | 'transactionsValidation'
+  | 'transactionDates'
+  | 'transactionAmounts'
+  | 'transactionMetadata'
+  | 'transactionReference';
+
+export interface MaxDesktopDiagnostic {
+  readonly stage: MaxDesktopStage;
+  readonly reason: 'UNAVAILABLE';
+  readonly httpStatus: number | null;
+}
+
+/** Only fixed diagnostics may cross the desktop worker boundary. */
+export class MaxDesktopError extends Error {
+  readonly stage: MaxDesktopStage;
+  readonly reason = 'UNAVAILABLE' as const;
+  readonly httpStatus: number | null;
+  readonly diagnostic: MaxDesktopDiagnostic;
+
+  constructor(stage: MaxDesktopStage, httpStatus: number | null = null) {
+    super('PROVIDER_UNAVAILABLE');
+    this.name = 'MaxDesktopError';
+    this.stage = MAX_DESKTOP_STAGES.includes(stage) ? stage : 'transactionsValidation';
+    this.httpStatus =
+      typeof httpStatus === 'number' && Number.isInteger(httpStatus) && httpStatus >= 100 && httpStatus <= 599
+        ? httpStatus
+        : null;
+    this.diagnostic = Object.freeze({ stage: this.stage, reason: this.reason, httpStatus: this.httpStatus });
+    Object.freeze(this);
+  }
+}
+
+function desktopResponse(value: unknown): unknown {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) throw new MaxDesktopError('transactionsResponse');
+  const response = value as Record<string, unknown>;
+  const keys = Object.keys(response).sort().join(',');
+  if (response.ok === true && keys === 'data,httpStatus,ok' && response.httpStatus === 200) return response.data;
+  if (
+    response.ok === false &&
+    keys === 'httpStatus,ok,reason,stage' &&
+    response.reason === 'UNAVAILABLE' &&
+    ((response.stage === 'transactionsRequest' &&
+      (response.httpStatus === null ||
+        (typeof response.httpStatus === 'number' &&
+          Number.isInteger(response.httpStatus) &&
+          response.httpStatus >= 100 &&
+          response.httpStatus <= 599 &&
+          response.httpStatus !== 200))) ||
+      (response.stage === 'transactionsResponse' && response.httpStatus === 200))
+  )
+    throw new MaxDesktopError(response.stage, response.httpStatus);
+  throw new MaxDesktopError('transactionsResponse');
+}
+
 function desktopDay(value: unknown): string | undefined {
   if (
     typeof value !== 'string' ||
@@ -412,7 +479,10 @@ function desktopDay(value: unknown): string | undefined {
   )
     return undefined;
   const day = value.slice(0, 10);
-  return new Date(`${day}T00:00:00Z`).toISOString().slice(0, 10) === day && Number.isFinite(Date.parse(value))
+  const timestamp = Date.parse(`${day}T00:00:00Z`);
+  return Number.isFinite(timestamp) &&
+    new Date(timestamp).toISOString().slice(0, 10) === day &&
+    Number.isFinite(Date.parse(value))
     ? day
     : undefined;
 }
@@ -423,42 +493,49 @@ export function getMaxMinimumStartDate(): Date {
 }
 
 function desktopTransaction(value: unknown): { accountNumber: string; transaction: Transaction } {
-  if (!value || typeof value !== 'object' || Array.isArray(value)) throw new Error('PROVIDER_UNAVAILABLE');
+  if (!value || typeof value !== 'object' || Array.isArray(value))
+    throw new MaxDesktopError('transactionsValidation', 200);
   const row = value as ScrapedTransaction;
   const purchaseDay = desktopDay(row.purchaseDate);
   const pending = row.paymentDate == null;
   const paymentDay = pending ? purchaseDay : desktopDay(row.paymentDate);
+  if (!purchaseDay || !paymentDay || purchaseDay > paymentDay) throw new MaxDesktopError('transactionDates', 200);
   if (
-    !purchaseDay ||
-    !paymentDay ||
-    purchaseDay > paymentDay ||
-    typeof row.shortCardNumber !== 'string' ||
-    !/^\d{4}$/.test(row.shortCardNumber) ||
     typeof row.actualPaymentAmount !== 'string' ||
     !/^-?(?:0|[1-9]\d{0,13})(?:\.\d{1,2})?$/.test(row.actualPaymentAmount) ||
     !Number.isFinite(row.originalAmount) ||
     typeof row.originalCurrency !== 'string' ||
     !/^[A-Z]{3}$/.test(row.originalCurrency) ||
+    !(row.paymentCurrency === null || row.paymentCurrency === undefined || Number.isSafeInteger(row.paymentCurrency))
+  )
+    throw new MaxDesktopError('transactionAmounts', 200);
+  if (
+    typeof row.shortCardNumber !== 'string' ||
+    !/^\d{4}$/.test(row.shortCardNumber) ||
     typeof row.planName !== 'string' ||
     row.planName.length > 200 ||
     !Number.isSafeInteger(row.planTypeId) ||
     typeof row.comments !== 'string' ||
     row.comments.length > 1000 ||
     typeof row.merchantName !== 'string' ||
-    row.merchantName.length > 4000 ||
-    !(row.paymentCurrency === null || row.paymentCurrency === undefined || Number.isSafeInteger(row.paymentCurrency))
+    row.merchantName.length > 4000
   )
-    throw new Error('PROVIDER_UNAVAILABLE');
-  const type = getTransactionType(row.planName, row.planTypeId);
+    throw new MaxDesktopError('transactionMetadata', 200);
+  let type: TransactionTypes;
+  try {
+    type = getTransactionType(row.planName, row.planTypeId);
+  } catch {
+    throw new MaxDesktopError('transactionMetadata', 200);
+  }
   const installments = type === TransactionTypes.Installments ? getInstallmentsInfo(row.comments) : undefined;
   if (
     type === TransactionTypes.Installments &&
     (!installments || installments.number < 1 || installments.total > 1200 || installments.number > installments.total)
   )
-    throw new Error('PROVIDER_UNAVAILABLE');
+    throw new MaxDesktopError('transactionMetadata', 200);
   const arn = row.dealData?.arn;
   if (arn !== undefined && (typeof arn !== 'string' || !/^[A-Za-z0-9_-]{1,200}$/.test(arn)))
-    throw new Error('PROVIDER_UNAVAILABLE');
+    throw new MaxDesktopError('transactionReference', 200);
   return {
     accountNumber: row.shortCardNumber,
     transaction: {
@@ -507,74 +584,89 @@ export class MaxScraper extends BaseScraperWithBrowser<ScraperSpecificCredential
         limits.maxRows < 1 ||
         limits.maxRows > 5000
       )
-        throw new Error('PROVIDER_UNAVAILABLE');
+        throw new MaxDesktopError('transactionsValidation');
       const first = moment.utc(limits.from).startOf('month'),
         last = moment.utc(limits.to).startOf('month');
       const count = last.diff(first, 'months') + 1;
-      if (count < 1 || count > 49) throw new Error('PROVIDER_UNAVAILABLE');
+      if (count < 1 || count > 49) throw new MaxDesktopError('transactionsValidation');
       const accounts = new Map<string, Transaction[]>();
       let scanned = 0;
       for (let month = 0; month < count; month += 1) {
-        const data: unknown = await this.page.evaluate(
-          async (url, maxBytes) => {
-            try {
-              if (location.origin !== 'https://www.max.co.il' || location.pathname !== '/homepage/personal')
-                throw new Error();
-              const controller = new AbortController();
-              const timer = setTimeout(() => controller.abort(), 15000);
+        let browserResult: unknown;
+        try {
+          browserResult = await this.page.evaluate(
+            async (url, maxBytes) => {
+              let stage: 'transactionsRequest' | 'transactionsResponse' = 'transactionsRequest';
+              let httpStatus: number | null = null;
               try {
-                const response = await fetch(url, {
-                  credentials: 'include',
-                  redirect: 'error',
-                  signal: controller.signal,
-                });
-                if (
-                  response.status !== 200 ||
-                  !/^application\/json(?:;|$)/i.test(response.headers.get('content-type') ?? '') ||
-                  !response.body
-                )
+                if (location.origin !== 'https://www.max.co.il' || location.pathname !== '/homepage/personal')
                   throw new Error();
-                const reader = response.body.getReader();
-                const decoder = new TextDecoder();
-                let text = '',
-                  bytes = 0;
-                for (;;) {
-                  const chunk = await reader.read();
-                  if (chunk.done) break;
-                  bytes += chunk.value.byteLength;
-                  if (bytes > maxBytes) {
-                    await reader.cancel();
+                const controller = new AbortController();
+                const timer = setTimeout(() => controller.abort(), 15000);
+                try {
+                  const response = await fetch(url, {
+                    credentials: 'include',
+                    redirect: 'error',
+                    signal: controller.signal,
+                  });
+                  httpStatus =
+                    Number.isInteger(response.status) && response.status >= 100 && response.status <= 599
+                      ? response.status
+                      : null;
+                  if (httpStatus !== 200) throw new Error();
+                  stage = 'transactionsResponse';
+                  if (!/^application\/json(?:;|$)/i.test(response.headers.get('content-type') ?? '') || !response.body)
                     throw new Error();
+                  const reader = response.body.getReader();
+                  const decoder = new TextDecoder();
+                  let text = '',
+                    bytes = 0;
+                  for (;;) {
+                    const chunk = await reader.read();
+                    if (chunk.done) break;
+                    bytes += chunk.value.byteLength;
+                    if (bytes > maxBytes) {
+                      await reader.cancel();
+                      throw new Error();
+                    }
+                    text += decoder.decode(chunk.value, { stream: true });
                   }
-                  text += decoder.decode(chunk.value, { stream: true });
+                  return { ok: true, httpStatus: 200, data: JSON.parse(text + decoder.decode()) as unknown };
+                } finally {
+                  clearTimeout(timer);
                 }
-                return JSON.parse(text + decoder.decode()) as unknown;
-              } finally {
-                clearTimeout(timer);
+              } catch {
+                return { ok: false, stage, reason: 'UNAVAILABLE', httpStatus };
               }
-            } catch {
-              throw new Error('PROVIDER_UNAVAILABLE');
-            }
-          },
-          getTransactionsUrl(first.clone().add(month, 'months')),
-          2_000_000,
-        );
-        if (!data || typeof data !== 'object' || Array.isArray(data)) throw new Error('PROVIDER_UNAVAILABLE');
+            },
+            getTransactionsUrl(first.clone().add(month, 'months')),
+            2_000_000,
+          );
+        } catch {
+          throw new MaxDesktopError('transactionsRequest');
+        }
+        const data = desktopResponse(browserResult);
+        if (!data || typeof data !== 'object' || Array.isArray(data))
+          throw new MaxDesktopError('transactionsResponse', 200);
         const envelope = (data as ScrapedTransactionsResult).result;
         if (
           !envelope ||
-          !Array.isArray(envelope.transactions) ||
-          (scanned += envelope.transactions.length) > limits.maxRows
+          typeof envelope !== 'object' ||
+          Array.isArray(envelope) ||
+          !Array.isArray(envelope.transactions)
         )
-          throw new Error('PROVIDER_UNAVAILABLE');
+          throw new MaxDesktopError('transactionsResponse', 200);
+        if ((scanned += envelope.transactions.length) > limits.maxRows)
+          throw new MaxDesktopError('transactionsValidation', 200);
         for (const raw of envelope.transactions) {
-          if (!raw || typeof raw !== 'object' || Array.isArray(raw)) throw new Error('PROVIDER_UNAVAILABLE');
+          if (!raw || typeof raw !== 'object' || Array.isArray(raw))
+            throw new MaxDesktopError('transactionsValidation', 200);
           // The ordinary Max parser skips summary rows without a plan type.
           // They still count toward the raw response budget above.
           if (!raw.planName) continue;
           const { accountNumber, transaction } = desktopTransaction(raw);
           if (!accounts.has(accountNumber)) accounts.set(accountNumber, []);
-          if (accounts.size > limits.maxAccounts) throw new Error('PROVIDER_UNAVAILABLE');
+          if (accounts.size > limits.maxAccounts) throw new MaxDesktopError('transactionsValidation', 200);
           // Billing-month queries can include adjacent dates. Preserve the actual
           // settlement date; never invoke fixInstallments or guess a charge date.
           const day = transaction.processedDate.slice(0, 10);
@@ -582,8 +674,9 @@ export class MaxScraper extends BaseScraperWithBrowser<ScraperSpecificCredential
         }
       }
       return { success: true, accounts: Array.from(accounts, ([accountNumber, txns]) => ({ accountNumber, txns })) };
-    } catch {
-      throw new Error('PROVIDER_UNAVAILABLE');
+    } catch (error) {
+      if (error instanceof MaxDesktopError) throw error;
+      throw new MaxDesktopError('transactionsValidation');
     }
   }
 
