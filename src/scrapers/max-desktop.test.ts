@@ -209,9 +209,9 @@ test('Max desktop skips documented summary rows while budgeting every raw row an
 });
 
 test.each([
-  [{ purchaseDate: 'private invalid date' }, 'transactionDates'],
-  [{ purchaseDate: '2026-99-99' }, 'transactionDates'],
-  [{ paymentDate: '2026-09-01' }, 'transactionDates'],
+  [{ purchaseDate: 'private invalid date' }, 'transactionPurchaseDate'],
+  [{ purchaseDate: '2026-99-99' }, 'transactionPurchaseDate'],
+  [{ paymentDate: '2026-09-01' }, 'transactionDateOrder'],
   [{ actualPaymentAmount: 'private invalid amount' }, 'transactionAmounts'],
   [{ originalAmount: Infinity }, 'transactionAmounts'],
   [{ originalCurrency: 'private invalid currency' }, 'transactionAmounts'],
@@ -346,4 +346,85 @@ test('Max desktop executes the bounded browser fetch and preserves only actual H
     if (priorLocation) Object.defineProperty(globalThis, 'location', priorLocation);
     else Reflect.deleteProperty(globalThis, 'location');
   }
+});
+
+test.each([
+  ['2026-09-20T00:00:00', '2026-10-02T00:00:00'],
+  ['2026-09-20T12:34:56.1234567', '2026-10-02T23:59:59.0000000'],
+  ['2026-09-20T12:34:56.1', '2026-10-02T23:59:59.123456789'],
+  ['2026-09-20T23:30:00-03:00', '2026-10-02T00:30:00+03:00'],
+  ['2026-09-20T23:30:00.1234567-12:00', '2026-10-02T00:30:00.1234567+14:00'],
+  ['2026-09-20', '2026-10-02'],
+])('Max desktop preserves written calendar dates for strict ISO forms: %s / %s', async (purchaseDate, paymentDate) => {
+  const { scraper } = fixture([{ result: { transactions: [{ ...row, purchaseDate, paymentDate }] } }]);
+  const result = await scraper.fetchDesktopTransactions(limits);
+  expect(result.accounts[0].txns[0]).toMatchObject({
+    date: '2026-09-20T00:00:00.000Z',
+    processedDate: '2026-10-02T00:00:00.000Z',
+  });
+});
+
+test('Max desktop accepts leap days and timezone-less DST gap times without interpreting the host timezone', async () => {
+  for (const [purchaseDate, paymentDate, day] of [
+    ['2024-02-29T23:59:59.1234567', '2024-02-29T23:59:59', '2024-02-29'],
+    ['2026-03-08T02:30:00', '2026-03-08T02:30:00.0000000', '2026-03-08'],
+  ]) {
+    const { scraper } = fixture([{ result: { transactions: [{ ...row, purchaseDate, paymentDate }] } }]);
+    const result = await scraper.fetchDesktopTransactions({ ...limits, from: day, to: day });
+    expect(result.accounts[0].txns[0]).toMatchObject({
+      date: `${day}T00:00:00.000Z`,
+      processedDate: `${day}T00:00:00.000Z`,
+    });
+  }
+});
+
+test.each([
+  '2026-02-29T00:00:00',
+  '2026-04-31T00:00:00.1234567',
+  '2026-00-10T00:00:00',
+  '2026-13-01T00:00:00',
+  '2026-10-00T00:00:00',
+  '2026-10-02T24:00:00',
+  '2026-10-02T23:60:00',
+  '2026-10-02T23:59:60',
+  '2026-10-02T12:00:00+24:00',
+  '2026-10-02T12:00:00-02:60',
+  '2026-10-02T12:00:00+3:00',
+  '2026-10-02T12:00:00.1234567890',
+  '2026-10-02T12:00:00.',
+  '2026-10-02T12:00',
+  '2026-10-02 12:00:00',
+  '02/10/2026',
+  '2026-10-02Z',
+  '2026-10-02T12:00:00Z private',
+  '2026-10-02T12:00:00Z\n',
+  '2026-10-02T12:00:00\r',
+  1790899200000,
+])('Max desktop rejects invalid or ambiguous purchase/payment dates: %s', async value => {
+  for (const field of ['purchaseDate', 'paymentDate'] as const) {
+    const { scraper } = fixture([{ result: { transactions: [{ ...row, [field]: value }] } }]);
+    await expect(scraper.fetchDesktopTransactions(limits)).rejects.toMatchObject({
+      message: 'PROVIDER_UNAVAILABLE',
+      diagnostic: {
+        stage: field === 'purchaseDate' ? 'transactionPurchaseDate' : 'transactionPaymentDate',
+        reason: 'UNAVAILABLE',
+        httpStatus: 200,
+      },
+    });
+  }
+});
+
+test('Max desktop keeps purchase before settlement validation on written calendar days', async () => {
+  const { scraper } = fixture([
+    {
+      result: {
+        transactions: [{ ...row, purchaseDate: '2026-10-03T00:30:00+14:00', paymentDate: '2026-10-02T23:30:00-12:00' }],
+      },
+    },
+  ]);
+  await expect(scraper.fetchDesktopTransactions(limits)).rejects.toMatchObject({
+    message: 'PROVIDER_UNAVAILABLE',
+    diagnostic: { stage: 'transactionDateOrder', reason: 'UNAVAILABLE', httpStatus: 200 },
+  });
+  expect(new MaxDesktopError('transactionDates', 200).stage).toBe('transactionDates');
 });

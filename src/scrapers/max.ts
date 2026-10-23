@@ -408,6 +408,9 @@ const MAX_DESKTOP_STAGES = [
   'transactionsResponse',
   'transactionsValidation',
   'transactionDates',
+  'transactionPurchaseDate',
+  'transactionPaymentDate',
+  'transactionDateOrder',
   'transactionAmounts',
   'transactionMetadata',
   'transactionReference',
@@ -418,6 +421,9 @@ export type MaxDesktopStage =
   | 'transactionsResponse'
   | 'transactionsValidation'
   | 'transactionDates'
+  | 'transactionPurchaseDate'
+  | 'transactionPaymentDate'
+  | 'transactionDateOrder'
   | 'transactionAmounts'
   | 'transactionMetadata'
   | 'transactionReference';
@@ -473,18 +479,18 @@ function desktopResponse(value: unknown): unknown {
 function desktopDay(value: unknown): string | undefined {
   if (
     typeof value !== 'string' ||
-    !/^\d{4}-\d{2}-\d{2}(?:T(?:[01]\d|2[0-3]):[0-5]\d:[0-5]\d(?:\.\d{1,9})?(?:Z|[+-](?:[01]\d|2[0-3]):[0-5]\d))?$/.test(
+    value.trim() !== value ||
+    !/^\d{4}-\d{2}-\d{2}(?:T(?:[01]\d|2[0-3]):[0-5]\d:[0-5]\d(?:\.\d{1,9})?(?:Z|[+-](?:[01]\d|2[0-3]):[0-5]\d)?)?$/.test(
       value,
     )
   )
     return undefined;
+  // Max calendar dates may be date-only, timezone-less .NET-style ISO
+  // timestamps or zoned ISO timestamps. Validate the written day in UTC only;
+  // interpreting a timestamp in the host timezone would shift billing dates.
   const day = value.slice(0, 10);
   const timestamp = Date.parse(`${day}T00:00:00Z`);
-  return Number.isFinite(timestamp) &&
-    new Date(timestamp).toISOString().slice(0, 10) === day &&
-    Number.isFinite(Date.parse(value))
-    ? day
-    : undefined;
+  return Number.isFinite(timestamp) && new Date(timestamp).toISOString().slice(0, 10) === day ? day : undefined;
 }
 
 export function getMaxMinimumStartDate(): Date {
@@ -497,9 +503,11 @@ function desktopTransaction(value: unknown): { accountNumber: string; transactio
     throw new MaxDesktopError('transactionsValidation', 200);
   const row = value as ScrapedTransaction;
   const purchaseDay = desktopDay(row.purchaseDate);
+  if (!purchaseDay) throw new MaxDesktopError('transactionPurchaseDate', 200);
   const pending = row.paymentDate == null;
   const paymentDay = pending ? purchaseDay : desktopDay(row.paymentDate);
-  if (!purchaseDay || !paymentDay || purchaseDay > paymentDay) throw new MaxDesktopError('transactionDates', 200);
+  if (!paymentDay) throw new MaxDesktopError('transactionPaymentDate', 200);
+  if (purchaseDay > paymentDay) throw new MaxDesktopError('transactionDateOrder', 200);
   if (
     typeof row.actualPaymentAmount !== 'string' ||
     !/^-?(?:0|[1-9]\d{0,13})(?:\.\d{1,2})?$/.test(row.actualPaymentAmount) ||
