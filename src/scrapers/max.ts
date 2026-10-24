@@ -640,6 +640,10 @@ function desktopAmountMinorUnits(value: string): bigint | undefined {
 /** Validate decimal cents without floating-point multiplication or rounding.
  * The numeric output must serialize back to the same exact minor units. */
 function desktopAmount(value: unknown): number | undefined {
+  // Browser JSON parsing has already converted numeric tokens to doubles.
+  // Stay below the range where adjacent decimal cents can collapse together.
+  // Strings retain their decimal source and use the exact round-trip check.
+  if (typeof value === 'number' && Math.abs(value) >= 2 ** 45) return undefined;
   const text =
     typeof value === 'string' ? value : typeof value === 'number' && Number.isFinite(value) ? String(value) : undefined;
   if (text === undefined) return undefined;

@@ -730,7 +730,6 @@ test.each([
   [0.29, -0.29],
   [0.01, -0.01],
   [1.1, -1.1],
-  [90071992547409, -90071992547409],
   ['0', -0],
   ['-0', 0],
   ['12.34', -12.34],
@@ -789,4 +788,26 @@ test.each([
   const error = await compatibilityFailure([{ ...row, actualPaymentAmount }]);
   expect(error.diagnostic).toMatchObject({ stage: 'transactionAmounts', reason: 'UNAVAILABLE', httpStatus: 200 });
   expect(error.message).toBe('PROVIDER_UNAVAILABLE');
+});
+
+test('Max desktop rejects large JSON numbers whose source cents may collapse before validation', async () => {
+  for (const literal of [
+    '90071992547409.91',
+    '-90071992547409.91',
+    '70368744177664.01',
+    '35184372088832',
+    '-35184372088832',
+  ]) {
+    const actualPaymentAmount: number = JSON.parse(literal);
+    const error = await compatibilityFailure([{ ...row, actualPaymentAmount }]);
+    expect(error.diagnostic.stage).toBe('transactionAmounts');
+  }
+  // Below the numeric guard, cent-valued source tokens remain distinct.
+  for (const literal of ['35184372088831.99', '-35184372088831.99', '1000000.01']) {
+    const actualPaymentAmount: number = JSON.parse(literal);
+    const result = await fixture([
+      { result: { transactions: [{ ...row, actualPaymentAmount }] } },
+    ]).scraper.fetchDesktopTransactions(limits);
+    expect(result.accounts[0].txns[0].chargedAmount).toBe(-actualPaymentAmount);
+  }
 });
