@@ -166,7 +166,9 @@ class BaseScraperWithBrowser<TCredentials extends ScraperCredentials> extends Ba
     debug(`launch a browser with headless mode = ${headless}`);
 
     const browser = await puppeteer.launch({
-      env: this.options.verbose ? { DEBUG: '*', ...process.env } : undefined,
+      // Never enable protocol debugging or pass the controller's environment to
+      // a bank browser. Dedicated desktop browser integration is supplied separately.
+      env: { PATH: process.env.PATH || '/usr/bin:/bin' },
       headless,
       executablePath,
       args,
@@ -290,13 +292,7 @@ class BaseScraperWithBrowser<TCredentials extends ScraperCredentials> extends Ba
     debug(`terminating browser with success = ${_success}`);
     this.emitProgress(ScraperProgressTypes.Terminating);
 
-    if (!_success && !!this.options.storeFailureScreenShotPath) {
-      debug(`create a snapshot before terminated in ${this.options.storeFailureScreenShotPath}`);
-      await this.page.screenshot({
-        path: this.options.storeFailureScreenShotPath,
-        fullPage: true,
-      });
-    }
+    // Banking screenshots are intentionally unavailable in this security fork.
 
     await Promise.all(this.cleanups.reverse().map(safeCleanup));
     this.cleanups = [];

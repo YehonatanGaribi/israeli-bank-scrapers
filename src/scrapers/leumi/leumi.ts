@@ -1,4 +1,5 @@
-import moment, { type Moment } from 'moment';
+import moment from 'moment-timezone';
+import { type Moment } from 'moment';
 import { type Page } from 'puppeteer';
 import { SHEKEL_CURRENCY } from '../../constants';
 import { getDebug } from '../../helpers/debug';
@@ -22,6 +23,32 @@ const DATE_FORMAT = 'DD.MM.YY';
 const ACCOUNT_BLOCKED_MSG = 'המנוי חסום';
 const INVALID_PASSWORD_MSG = 'אחד או יותר מפרטי ההזדהות שמסרת שגויים. ניתן לנסות שוב';
 const CHANGE_PASSWORD_MODAL_SELECTOR = 'form input[name="newPwd"]';
+type DesktopTransactionLimits = { maxAccounts: number; maxRows: number };
+type DesktopRowBudget = { remaining: number };
+
+function validateDesktopRows(rows: any[] | null) {
+  for (const row of rows ?? []) {
+    // Moment accepts an absent input as the current time. The desktop path
+    // must reject missing source dates rather than manufacture a booking date.
+    if (
+      !row ||
+      typeof row.DateUTC !== 'string' ||
+      row.DateUTC.length > 40 ||
+      !/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{1,7})?(?:Z|[+-]\d{2}:\d{2})$/.test(row.DateUTC) ||
+      !moment.parseZone(row.DateUTC, moment.ISO_8601, true).isValid() ||
+      typeof row.Amount !== 'number' ||
+      !Number.isFinite(row.Amount) ||
+      typeof row.Description !== 'string' ||
+      row.Description.length > 2000
+    ) {
+      throw new Error('PROVIDER_UNAVAILABLE');
+    }
+  }
+}
+
+export function getLeumiMinimumStartDate(now = new Date()): Date {
+  return moment(now).tz('Asia/Jerusalem').subtract(3, 'years').add(1, 'day').startOf('day').toDate();
+}
 
 interface SavingsDepositItem {
   index: string;
@@ -163,6 +190,7 @@ async function fetchTransactionsForAccount(
   startDate: Moment,
   accountId: string,
   options: ScraperOptions,
+  budget?: DesktopRowBudget,
 ): Promise<TransactionsAccount> {
   // DEVELOPER NOTICE the account number received from the server is being altered at
   // runtime for some accounts after 1-2 seconds so we need to hang the process for a short while.
@@ -180,19 +208,45 @@ async function fetchTransactionsForAccount(
   // we must blur the from control otherwise the search will use the previous value
   await page.focus("button[aria-label='סנן']");
 
-  await clickButton(page, "button[aria-label='סנן']");
-  const finalResponse = await page.waitForResponse(response => {
+  const responsePending = page.waitForResponse(response => {
     return response.url() === FILTERED_TRANSACTIONS_URL && response.request().method() === 'POST';
   });
+  // Subscribe before the click: a fast response can arrive before click resolves.
+  // A failed click must not leave a later timeout as an unhandled rejection.
+  void responsePending.catch(() => undefined);
+  await clickButton(page, "button[aria-label='סנן']");
+  const finalResponse = await responsePending;
 
   const responseJson: any = await finalResponse.json();
 
   const accountNumber = accountId.replace('/', '_').replace(/[^\d-_]/g, '');
 
+  if (
+    budget &&
+    (!responseJson || typeof responseJson.jsonResp !== 'string' || responseJson.jsonResp.length > 1000000)
+  ) {
+    throw new Error('PROVIDER_UNAVAILABLE');
+  }
   const response = JSON.parse(responseJson.jsonResp);
+  if (budget && (!response || typeof response !== 'object' || Array.isArray(response))) {
+    throw new Error('PROVIDER_UNAVAILABLE');
+  }
 
   const pendingTransactions = response.TodayTransactionsItems;
   const transactions = response.HistoryTransactionsItems;
+  if (
+    budget &&
+    ((!Array.isArray(pendingTransactions) && pendingTransactions !== null) ||
+      (!Array.isArray(transactions) && transactions !== null) ||
+      (pendingTransactions?.length ?? 0) + (transactions?.length ?? 0) > budget.remaining)
+  ) {
+    throw new Error('PROVIDER_UNAVAILABLE');
+  }
+  if (budget) {
+    validateDesktopRows(pendingTransactions);
+    validateDesktopRows(transactions);
+    budget.remaining -= (pendingTransactions?.length ?? 0) + (transactions?.length ?? 0);
+  }
   const balance = response.BalanceDisplay ? parseFloat(response.BalanceDisplay) : undefined;
 
   const pendingTxns = extractTransactionsFromPage(pendingTransactions, TransactionStatuses.Pending, options);
@@ -211,9 +265,10 @@ async function fetchRegularAccounts(
   page: Page,
   startDate: Moment,
   options: ScraperOptions,
+  limits?: DesktopTransactionLimits,
 ): Promise<TransactionsAccount[]> {
   await scraper.navigateTo(TRANSACTIONS_URL);
-  return fetchTransactions(page, startDate, options);
+  return fetchTransactions(page, startDate, options, limits);
 }
 
 async function getSavingsAccounts(page: Page, accountId: string): Promise<TransactionsAccount[]> {
@@ -263,6 +318,7 @@ async function fetchTransactions(
   page: Page,
   startDate: Moment,
   options: ScraperOptions,
+  limits?: DesktopTransactionLimits,
 ): Promise<TransactionsAccount[]> {
   const accounts: TransactionsAccount[] = [];
 
@@ -276,9 +332,27 @@ async function fetchTransactions(
 
   // due to a bug, the altered value might include undesired signs like & that should be removed
 
-  if (!accountsIds.length) {
+  if (!Array.isArray(accountsIds) || !accountsIds.length) {
     throw new Error('Failed to extract or parse the account number');
   }
+  if (limits) {
+    if (
+      accountsIds.length > limits.maxAccounts ||
+      accountsIds.some(
+        id => typeof id !== 'string' || !id.trim() || id.length > 256 || /[\u0000-\u001f\u007f'"\\]/.test(id),
+      )
+    ) {
+      throw new Error('PROVIDER_UNAVAILABLE');
+    }
+    const normalized = accountsIds.map(id =>
+      removeSpecialCharacters(id)
+        .replace('/', '_')
+        .replace(/[^\d-_]/g, ''),
+    );
+    if (normalized.some(id => !id) || new Set(normalized).size !== normalized.length)
+      throw new Error('PROVIDER_UNAVAILABLE');
+  }
+  const budget = limits ? { remaining: limits.maxRows } : undefined;
 
   for (const accountId of accountsIds) {
     if (accountsIds.length > 1) {
@@ -287,7 +361,14 @@ async function fetchTransactions(
       await clickByXPath(page, `xpath///span[contains(text(), '${accountId}')]`);
     }
 
-    accounts.push(await fetchTransactionsForAccount(page, startDate, removeSpecialCharacters(accountId), options));
+    const account = await fetchTransactionsForAccount(
+      page,
+      startDate,
+      removeSpecialCharacters(accountId),
+      options,
+      budget,
+    );
+    accounts.push(account);
   }
 
   return accounts;
@@ -367,6 +448,36 @@ class LeumiScraper extends BaseScraperWithBrowser<ScraperSpecificCredentials> {
       accounts,
     };
   }
+
+  /** Confined desktop import: reuse the regular-account selectors and parser,
+   * bounded before mapping rows. Do not fetch unrelated savings/forex data.
+   * The caller has already obtained a manually authenticated scoped bank Page.
+   */
+  async fetchDesktopTransactions(limits: DesktopTransactionLimits): Promise<ScraperScrapingResult> {
+    if (
+      !limits ||
+      !Number.isSafeInteger(limits.maxAccounts) ||
+      limits.maxAccounts < 1 ||
+      limits.maxAccounts > 20 ||
+      !Number.isSafeInteger(limits.maxRows) ||
+      limits.maxRows < 1 ||
+      limits.maxRows > 5000
+    ) {
+      throw new Error('PROVIDER_UNAVAILABLE');
+    }
+    const minimumStartMoment = moment().subtract(3, 'years').add(1, 'day');
+    const defaultStartMoment = moment().subtract(1, 'years').add(1, 'day');
+    const startDate = this.options.startDate || defaultStartMoment.toDate();
+    if (!moment(startDate).isValid() || moment(startDate).isBefore(getLeumiMinimumStartDate())) {
+      throw new Error('DATE_RANGE_UNSUPPORTED');
+    }
+    const startMoment = moment.max(minimumStartMoment, moment(startDate));
+    return {
+      success: true,
+      accounts: await fetchRegularAccounts(this, this.page, startMoment, this.options, limits),
+    };
+  }
 }
 
 export default LeumiScraper;
+export { LeumiScraper };

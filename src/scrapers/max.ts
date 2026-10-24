@@ -28,7 +28,7 @@ export interface ScrapedTransaction {
   shortCardNumber: string;
   paymentDate?: string;
   purchaseDate: string;
-  actualPaymentAmount: string;
+  actualPaymentAmount: string | number;
   paymentCurrency: number | null;
   originalCurrency: string;
   originalAmount: number;
@@ -266,7 +266,7 @@ function mapTransaction(rawTransaction: ScrapedTransaction, options?: ScraperOpt
     processedDate,
     originalAmount: -rawTransaction.originalAmount,
     originalCurrency: rawTransaction.originalCurrency,
-    chargedAmount: -rawTransaction.actualPaymentAmount,
+    chargedAmount: -Number(rawTransaction.actualPaymentAmount),
     chargedCurrency: getChargedCurrency(rawTransaction.paymentCurrency),
     description: rawTransaction.merchantName.trim(),
     memo: getMemo(rawTransaction),
@@ -396,7 +396,460 @@ function createLoginFields(credentials: ScraperSpecificCredentials) {
 
 type ScraperSpecificCredentials = { username: string; password: string };
 
-class MaxScraper extends BaseScraperWithBrowser<ScraperSpecificCredentials> {
+export interface MaxDesktopTransactionLimits {
+  from: string;
+  to: string;
+  maxAccounts: number;
+  maxRows: number;
+}
+
+const MAX_DESKTOP_STAGES = [
+  'transactionsRequest',
+  'transactionsResponse',
+  'transactionsValidation',
+  'transactionDates',
+  'transactionPurchaseDate',
+  'transactionPaymentDate',
+  'transactionDateOrder',
+  'transactionAmounts',
+  'transactionMetadata',
+  'transactionReference',
+] as const;
+
+export type MaxDesktopStage =
+  | 'transactionsRequest'
+  | 'transactionsResponse'
+  | 'transactionsValidation'
+  | 'transactionDates'
+  | 'transactionPurchaseDate'
+  | 'transactionPaymentDate'
+  | 'transactionDateOrder'
+  | 'transactionAmounts'
+  | 'transactionMetadata'
+  | 'transactionReference';
+
+const MAX_DESKTOP_COMPATIBILITY_FIELDS = [
+  'purchaseDate',
+  'paymentDate',
+  'actualPaymentAmount',
+  'paymentCurrency',
+  'originalCurrency',
+  'originalAmount',
+  'shortCardNumber',
+  'planName',
+  'planTypeId',
+  'comments',
+  'merchantName',
+  'dealData',
+  'arn',
+] as const;
+
+const MAX_DESKTOP_COMPATIBILITY_KINDS = [
+  'missing',
+  'null',
+  'boolean',
+  'safeInteger',
+  'decimalNumber',
+  'unsafeNumber',
+  'integerString',
+  'decimalString',
+  'emptyString',
+  'text',
+  'date',
+  'localTimestamp',
+  'zonedTimestamp',
+  'object',
+  'array',
+  'unsupported',
+] as const;
+
+export type MaxDesktopCompatibilityField = (typeof MAX_DESKTOP_COMPATIBILITY_FIELDS)[number];
+export type MaxDesktopCompatibilityKind = (typeof MAX_DESKTOP_COMPATIBILITY_KINDS)[number];
+export interface MaxDesktopCompatibilityEntry {
+  readonly field: MaxDesktopCompatibilityField;
+  readonly kinds: readonly MaxDesktopCompatibilityKind[];
+}
+export type MaxDesktopCompatibilityProfile = readonly MaxDesktopCompatibilityEntry[];
+
+function safeDesktopCompatibility(value: unknown): MaxDesktopCompatibilityProfile | undefined {
+  try {
+    if (!Array.isArray(value) || value.length !== MAX_DESKTOP_COMPATIBILITY_FIELDS.length) return undefined;
+    const profile: MaxDesktopCompatibilityEntry[] = [];
+    for (let index = 0; index < MAX_DESKTOP_COMPATIBILITY_FIELDS.length; index += 1) {
+      const entry: unknown = value[index];
+      if (!entry || typeof entry !== 'object' || Array.isArray(entry)) return undefined;
+      const record = entry as Record<string, unknown>;
+      if (
+        Object.keys(record).sort().join(',') !== 'field,kinds' ||
+        record.field !== MAX_DESKTOP_COMPATIBILITY_FIELDS[index]
+      )
+        return undefined;
+      if (!Array.isArray(record.kinds) || record.kinds.length > MAX_DESKTOP_COMPATIBILITY_KINDS.length)
+        return undefined;
+      const kinds: MaxDesktopCompatibilityKind[] = [];
+      for (const kind of record.kinds) {
+        if (!MAX_DESKTOP_COMPATIBILITY_KINDS.includes(kind as MaxDesktopCompatibilityKind)) return undefined;
+        kinds.push(kind as MaxDesktopCompatibilityKind);
+      }
+      if (new Set(kinds).size !== kinds.length || kinds.join(',') !== [...kinds].sort().join(',')) return undefined;
+      profile.push(Object.freeze({ field: MAX_DESKTOP_COMPATIBILITY_FIELDS[index], kinds: Object.freeze(kinds) }));
+    }
+    return Object.freeze(profile);
+  } catch {
+    return undefined;
+  }
+}
+
+export interface MaxDesktopDiagnostic {
+  readonly stage: MaxDesktopStage;
+  readonly reason: 'UNAVAILABLE';
+  readonly httpStatus: number | null;
+  readonly compatibility?: MaxDesktopCompatibilityProfile;
+}
+
+/** Only fixed diagnostics may cross the desktop worker boundary. */
+export class MaxDesktopError extends Error {
+  readonly stage: MaxDesktopStage;
+  readonly reason = 'UNAVAILABLE' as const;
+  readonly httpStatus: number | null;
+  readonly diagnostic: MaxDesktopDiagnostic;
+
+  constructor(stage: MaxDesktopStage, httpStatus: number | null = null, compatibility?: unknown) {
+    super('PROVIDER_UNAVAILABLE');
+    this.name = 'MaxDesktopError';
+    this.stage = MAX_DESKTOP_STAGES.includes(stage) ? stage : 'transactionsValidation';
+    this.httpStatus =
+      typeof httpStatus === 'number' && Number.isInteger(httpStatus) && httpStatus >= 100 && httpStatus <= 599
+        ? httpStatus
+        : null;
+    const profile =
+      this.httpStatus === 200 && this.stage !== 'transactionsRequest' && this.stage !== 'transactionsResponse'
+        ? safeDesktopCompatibility(compatibility)
+        : undefined;
+    this.diagnostic = Object.freeze({
+      stage: this.stage,
+      reason: this.reason,
+      httpStatus: this.httpStatus,
+      ...(profile ? { compatibility: profile } : {}),
+    });
+    Object.freeze(this);
+  }
+}
+
+function desktopResponse(value: unknown): unknown {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) throw new MaxDesktopError('transactionsResponse');
+  const response = value as Record<string, unknown>;
+  const keys = Object.keys(response).sort().join(',');
+  if (response.ok === true && keys === 'data,httpStatus,ok' && response.httpStatus === 200) return response.data;
+  if (
+    response.ok === false &&
+    keys === 'httpStatus,ok,reason,stage' &&
+    response.reason === 'UNAVAILABLE' &&
+    ((response.stage === 'transactionsRequest' &&
+      (response.httpStatus === null ||
+        (typeof response.httpStatus === 'number' &&
+          Number.isInteger(response.httpStatus) &&
+          response.httpStatus >= 100 &&
+          response.httpStatus <= 599 &&
+          response.httpStatus !== 200))) ||
+      (response.stage === 'transactionsResponse' && response.httpStatus === 200))
+  )
+    throw new MaxDesktopError(response.stage, typeof response.httpStatus === 'number' ? response.httpStatus : null);
+  throw new MaxDesktopError('transactionsResponse');
+}
+
+function desktopDay(value: unknown): string | undefined {
+  if (
+    typeof value !== 'string' ||
+    value.trim() !== value ||
+    !/^\d{4}-\d{2}-\d{2}(?:T(?:[01]\d|2[0-3]):[0-5]\d:[0-5]\d(?:\.\d{1,9})?(?:Z|[+-](?:[01]\d|2[0-3]):[0-5]\d)?)?$/.test(
+      value,
+    )
+  )
+    return undefined;
+  // Max calendar dates may be date-only, timezone-less .NET-style ISO
+  // timestamps or zoned ISO timestamps. Validate the written day in UTC only;
+  // interpreting a timestamp in the host timezone would shift billing dates.
+  const day = value.slice(0, 10);
+  const timestamp = Date.parse(`${day}T00:00:00Z`);
+  return Number.isFinite(timestamp) && new Date(timestamp).toISOString().slice(0, 10) === day ? day : undefined;
+}
+
+function desktopCompatibilityKind(value: unknown, field: MaxDesktopCompatibilityField): MaxDesktopCompatibilityKind {
+  if (value === undefined) return 'missing';
+  if (value === null) return 'null';
+  if (typeof value === 'boolean') return 'boolean';
+  if (typeof value === 'number') {
+    if (Number.isSafeInteger(value)) return 'safeInteger';
+    return Number.isFinite(value) && !Number.isInteger(value) ? 'decimalNumber' : 'unsafeNumber';
+  }
+  if (typeof value === 'string') {
+    if (!value.length) return 'emptyString';
+    if ((field === 'purchaseDate' || field === 'paymentDate') && desktopDay(value)) {
+      if (value.length === 10) return 'date';
+      return /(?:Z|[+-]\d{2}:\d{2})$/.test(value) ? 'zonedTimestamp' : 'localTimestamp';
+    }
+    if (value.trim() === value) {
+      if (/^-?\d+$/.test(value)) return 'integerString';
+      if (/^-?\d+\.\d+$/.test(value)) return 'decimalString';
+    }
+    return 'text';
+  }
+  if (Array.isArray(value)) return 'array';
+  if (typeof value === 'object') return 'object';
+  return 'unsupported';
+}
+
+/** Inspect only fixed consumed fields, never values, unknown keys or row counts.
+ * Aggregate the complete bounded month before validating its first transaction. */
+function desktopCompatibility(rows: unknown[]): MaxDesktopCompatibilityProfile {
+  const fields = MAX_DESKTOP_COMPATIBILITY_FIELDS.map(field => ({
+    field,
+    kinds: new Set<MaxDesktopCompatibilityKind>(),
+  }));
+  for (const value of rows) {
+    if (!value || typeof value !== 'object' || Array.isArray(value)) continue;
+    const row = value as Record<string, unknown>;
+    if (!row.planName) continue;
+    for (const { field, kinds } of fields) {
+      const dealData = row.dealData;
+      const consumed =
+        field === 'arn'
+          ? dealData && typeof dealData === 'object' && !Array.isArray(dealData)
+            ? (dealData as Record<string, unknown>).arn
+            : undefined
+          : row[field];
+      kinds.add(desktopCompatibilityKind(consumed, field));
+    }
+  }
+  return fields.map(({ field, kinds }) => ({ field, kinds: Array.from(kinds).sort() }));
+}
+
+export function getMaxMinimumStartDate(): Date {
+  const now = moment.utc().subtract(4, 'years');
+  return now.startOf('day').toDate();
+}
+
+function desktopAmountMinorUnits(value: string): bigint | undefined {
+  const match = /^(-?)(0|[1-9]\d{0,13})(?:\.(\d{1,2}))?$/.exec(value);
+  if (!match || match[0] !== value) return undefined;
+  const minorUnits = BigInt(match[2]) * 100n + BigInt((match[3] ?? '').padEnd(2, '0'));
+  return match[1] ? -minorUnits : minorUnits;
+}
+
+/** Validate decimal cents without floating-point multiplication or rounding.
+ * The numeric output must serialize back to the same exact minor units. */
+function desktopAmount(value: unknown): number | undefined {
+  // Browser JSON parsing has already converted numeric tokens to doubles.
+  // Stay below the range where adjacent decimal cents can collapse together.
+  // Strings retain their decimal source and use the exact round-trip check.
+  if (typeof value === 'number' && Math.abs(value) >= 2 ** 45) return undefined;
+  const text =
+    typeof value === 'string' ? value : typeof value === 'number' && Number.isFinite(value) ? String(value) : undefined;
+  if (text === undefined) return undefined;
+  const minorUnits = desktopAmountMinorUnits(text);
+  const maximumMinorUnits = BigInt(Number.MAX_SAFE_INTEGER);
+  if (minorUnits === undefined || minorUnits < -maximumMinorUnits || minorUnits > maximumMinorUnits) return undefined;
+  const amount = typeof value === 'number' ? value : Number(text);
+  return desktopAmountMinorUnits(String(amount)) === minorUnits ? amount : undefined;
+}
+
+function desktopTransaction(value: unknown): { accountNumber: string; transaction: Transaction } {
+  if (!value || typeof value !== 'object' || Array.isArray(value))
+    throw new MaxDesktopError('transactionsValidation', 200);
+  const row = value as ScrapedTransaction;
+  const purchaseDay = desktopDay(row.purchaseDate);
+  if (!purchaseDay) throw new MaxDesktopError('transactionPurchaseDate', 200);
+  const pending = row.paymentDate == null;
+  const paymentDay = pending ? purchaseDay : desktopDay(row.paymentDate);
+  if (!paymentDay) throw new MaxDesktopError('transactionPaymentDate', 200);
+  if (purchaseDay > paymentDay) throw new MaxDesktopError('transactionDateOrder', 200);
+  const chargedAmount = desktopAmount(row.actualPaymentAmount);
+  if (
+    chargedAmount === undefined ||
+    !Number.isFinite(row.originalAmount) ||
+    typeof row.originalCurrency !== 'string' ||
+    !/^[A-Z]{3}$/.test(row.originalCurrency) ||
+    !(row.paymentCurrency === null || row.paymentCurrency === undefined || Number.isSafeInteger(row.paymentCurrency))
+  )
+    throw new MaxDesktopError('transactionAmounts', 200);
+  if (
+    typeof row.shortCardNumber !== 'string' ||
+    !/^\d{4}$/.test(row.shortCardNumber) ||
+    typeof row.planName !== 'string' ||
+    row.planName.length > 200 ||
+    !Number.isSafeInteger(row.planTypeId) ||
+    typeof row.comments !== 'string' ||
+    row.comments.length > 1000 ||
+    typeof row.merchantName !== 'string' ||
+    row.merchantName.length > 4000
+  )
+    throw new MaxDesktopError('transactionMetadata', 200);
+  let type: TransactionTypes;
+  try {
+    type = getTransactionType(row.planName, row.planTypeId);
+  } catch {
+    throw new MaxDesktopError('transactionMetadata', 200);
+  }
+  const installments = type === TransactionTypes.Installments ? getInstallmentsInfo(row.comments) : undefined;
+  if (
+    type === TransactionTypes.Installments &&
+    (!installments || installments.number < 1 || installments.total > 1200 || installments.number > installments.total)
+  )
+    throw new MaxDesktopError('transactionMetadata', 200);
+  const arn = row.dealData?.arn;
+  if (arn !== undefined && (typeof arn !== 'string' || !/^[A-Za-z0-9_-]{1,200}$/.test(arn)))
+    throw new MaxDesktopError('transactionReference', 200);
+  return {
+    accountNumber: row.shortCardNumber,
+    transaction: {
+      type,
+      date: `${purchaseDay}T00:00:00.000Z`,
+      processedDate: `${paymentDay}T00:00:00.000Z`,
+      originalAmount: -row.originalAmount,
+      originalCurrency: row.originalCurrency,
+      chargedAmount: -chargedAmount,
+      chargedCurrency: getChargedCurrency(row.paymentCurrency),
+      description: row.merchantName.trim(),
+      // A billing date today or in the future does not establish settlement.
+      status:
+        pending || paymentDay >= moment.utc().format('YYYY-MM-DD')
+          ? TransactionStatuses.Pending
+          : TransactionStatuses.Completed,
+      ...(installments ? { installments } : {}),
+      ...(arn ? { identifier: installments ? `${arn}_${installments.number}` : arn } : {}),
+    },
+  };
+}
+
+export class MaxScraper extends BaseScraperWithBrowser<ScraperSpecificCredentials> {
+  /** Attach only the already scoped temporary page. The normal initializer adds
+   * request logging hooks and is deliberately unused by the desktop worker. */
+  initializeDesktopPage(page: Page): void {
+    this.page = page;
+  }
+
+  /** Manual login only; bounded billing months, no homepage, categories, balances,
+   * installment date rewriting, memo or raw response returned to the caller. */
+  async fetchDesktopTransactions(limits: MaxDesktopTransactionLimits) {
+    try {
+      if (
+        !limits ||
+        !desktopDay(limits.from) ||
+        limits.from.length !== 10 ||
+        !desktopDay(limits.to) ||
+        limits.to.length !== 10 ||
+        limits.from > limits.to ||
+        new Date(`${limits.from}T00:00:00Z`) < getMaxMinimumStartDate() ||
+        !Number.isSafeInteger(limits.maxAccounts) ||
+        limits.maxAccounts < 1 ||
+        limits.maxAccounts > 20 ||
+        !Number.isSafeInteger(limits.maxRows) ||
+        limits.maxRows < 1 ||
+        limits.maxRows > 5000
+      )
+        throw new MaxDesktopError('transactionsValidation');
+      const first = moment.utc(limits.from).startOf('month'),
+        last = moment.utc(limits.to).startOf('month');
+      const count = last.diff(first, 'months') + 1;
+      if (count < 1 || count > 49) throw new MaxDesktopError('transactionsValidation');
+      const accounts = new Map<string, Transaction[]>();
+      let scanned = 0;
+      for (let month = 0; month < count; month += 1) {
+        let browserResult: unknown;
+        try {
+          browserResult = await this.page.evaluate(
+            async (url, maxBytes) => {
+              let stage: 'transactionsRequest' | 'transactionsResponse' = 'transactionsRequest';
+              let httpStatus: number | null = null;
+              try {
+                if (location.origin !== 'https://www.max.co.il' || location.pathname !== '/homepage/personal')
+                  throw new Error();
+                const controller = new AbortController();
+                const timer = setTimeout(() => controller.abort(), 15000);
+                try {
+                  const response = await fetch(url, {
+                    credentials: 'include',
+                    redirect: 'error',
+                    signal: controller.signal,
+                  });
+                  httpStatus =
+                    Number.isInteger(response.status) && response.status >= 100 && response.status <= 599
+                      ? response.status
+                      : null;
+                  if (httpStatus !== 200) throw new Error();
+                  stage = 'transactionsResponse';
+                  if (!/^application\/json(?:;|$)/i.test(response.headers.get('content-type') ?? '') || !response.body)
+                    throw new Error();
+                  const reader = response.body.getReader();
+                  const decoder = new TextDecoder();
+                  let text = '',
+                    bytes = 0;
+                  for (;;) {
+                    const chunk = await reader.read();
+                    if (chunk.done) break;
+                    bytes += chunk.value.byteLength;
+                    if (bytes > maxBytes) {
+                      await reader.cancel();
+                      throw new Error();
+                    }
+                    text += decoder.decode(chunk.value, { stream: true });
+                  }
+                  return { ok: true, httpStatus: 200, data: JSON.parse(text + decoder.decode()) as unknown };
+                } finally {
+                  clearTimeout(timer);
+                }
+              } catch {
+                return { ok: false, stage, reason: 'UNAVAILABLE', httpStatus };
+              }
+            },
+            getTransactionsUrl(first.clone().add(month, 'months')),
+            2_000_000,
+          );
+        } catch {
+          throw new MaxDesktopError('transactionsRequest');
+        }
+        const data = desktopResponse(browserResult);
+        if (!data || typeof data !== 'object' || Array.isArray(data))
+          throw new MaxDesktopError('transactionsResponse', 200);
+        const envelope = (data as ScrapedTransactionsResult).result;
+        if (
+          !envelope ||
+          typeof envelope !== 'object' ||
+          Array.isArray(envelope) ||
+          !Array.isArray(envelope.transactions)
+        )
+          throw new MaxDesktopError('transactionsResponse', 200);
+        if ((scanned += envelope.transactions.length) > limits.maxRows)
+          throw new MaxDesktopError('transactionsValidation', 200);
+        const compatibility = desktopCompatibility(envelope.transactions);
+        try {
+          for (const raw of envelope.transactions) {
+            if (!raw || typeof raw !== 'object' || Array.isArray(raw))
+              throw new MaxDesktopError('transactionsValidation', 200);
+            // The ordinary Max parser skips summary rows without a plan type.
+            // They still count toward the raw response budget above.
+            if (!raw.planName) continue;
+            const { accountNumber, transaction } = desktopTransaction(raw);
+            if (!accounts.has(accountNumber)) accounts.set(accountNumber, []);
+            if (accounts.size > limits.maxAccounts) throw new MaxDesktopError('transactionsValidation', 200);
+            // Billing-month queries can include adjacent dates. Preserve the actual
+            // settlement date; never invoke fixInstallments or guess a charge date.
+            const day = transaction.processedDate.slice(0, 10);
+            if (day >= limits.from && day <= limits.to) accounts.get(accountNumber)!.push(transaction);
+          }
+        } catch (error) {
+          if (error instanceof MaxDesktopError) throw new MaxDesktopError(error.stage, error.httpStatus, compatibility);
+          throw new MaxDesktopError('transactionsValidation', 200, compatibility);
+        }
+      }
+      return { success: true, accounts: Array.from(accounts, ([accountNumber, txns]) => ({ accountNumber, txns })) };
+    } catch (error) {
+      if (error instanceof MaxDesktopError) throw error;
+      throw new MaxDesktopError('transactionsValidation');
+    }
+  }
+
   getLoginOptions(credentials: ScraperSpecificCredentials): LoginOptions {
     return {
       loginUrl: LOGIN_URL,
