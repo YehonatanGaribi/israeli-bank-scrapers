@@ -80,7 +80,7 @@ test('collects the period before mapping actual dates, refunds, installments and
   expect(f.page.evaluate.mock.calls.every(c => new URL(c[1]).origin === 'https://web.isracard.co.il')).toBe(true);
   expect(f.page.evaluate.mock.calls[1][2]).toMatchObject({ billingDate: '10/2026' });
   expect(f.page.evaluate.mock.calls[2][2]).toMatchObject({ billingMonth: '01/10/2026', isNextBillingDate: false });
-  expect(result.compatibility).toHaveLength(21);
+  expect(result.compatibility).toHaveLength(24);
   expect(JSON.stringify(result.compatibility)).not.toMatch(/SYNTHETIC_PRIVATE_SHOP|000001234|12\.34/);
 });
 test('accepts encoded/direct/Pascal-case wrappers, success primitives and neutral error codes for every endpoint', async () => {
@@ -194,4 +194,81 @@ test('HTTP and row limits still stop collection without leaking source values', 
   await expect(
     fetchIsracardWebTransactions(f.page as unknown as Page, { ...limits, maxRows: 2 }),
   ).rejects.toBeInstanceOf(IsracardWebError);
+});
+
+function debitData(rows: unknown[], date: unknown = '21/10/2026', extra: Record<string, unknown> = {}) {
+  return {
+    israelAbroadVouchers: {
+      vouchers: { totalForStatement: { isMonthlyPayment: false }, israelAbroadVouchersList: [] as unknown[] },
+      outOfStatementChargeDateVouchers: [
+        { totalVouchersCurrencyDate: { dateImmediateVouchers: date, ...extra }, immediateVouchersCurrencyDate: rows },
+      ],
+    },
+  };
+}
+test('seventeen debit vouchers use actual immediate processing dates rather than a future monthly statement', async () => {
+  const rows = Array.from({ length: 17 }, (_, i) => ({
+    ...row,
+    seqVoucherNumber: String(i + 1),
+    numberOfInstallment: null,
+    currentInstallmentNum: null,
+  }));
+  const r = await fixture([], { bill: '20/11/2026', data: debitData(rows) }).run();
+  expect(r.accounts[0].txns).toHaveLength(17);
+  expect(
+    r.accounts[0].txns.every(
+      t => t.status === TransactionStatuses.Completed && t.processedDate === '2026-10-21T00:00:00.000Z',
+    ),
+  ).toBe(true);
+  expect(r.accounts[0].txns[0]).toMatchObject({ settlement: 'immediate', chargedCurrency: 'ILS' });
+  expect(r.compatibility.find(e => e.field === 'reviewChecks')?.kinds).toEqual(['immediate', 'posted']);
+});
+test('explicit code or currency symbol wins; absent currency defaults to ILS and unknown or conflicting explicit currency never does', async () => {
+  const cases = [
+    { billingAmountCurrency: undefined, billingAmountCurrencySymbol: '₪' },
+    { billingAmountCurrency: null },
+    { billingAmountCurrency: undefined, billingAmountCurrencySymbol: '$' },
+    { billingAmountCurrency: 100, billingAmountCurrencySymbol: '€' },
+    { billingAmountCurrency: 19, billingAmountCurrencySymbol: '₪' },
+    { billingAmountCurrency: 999 },
+    { billingAmountCurrency: 999, billingAmountCurrencySymbol: '₪' },
+  ];
+  const r = await fixture(cases.map((c, i) => ({ ...row, seqVoucherNumber: String(i + 1), ...c }))).run();
+  const posted = r.accounts[0].txns.filter(t => t.status === TransactionStatuses.Completed);
+  expect(posted.map(t => t.chargedCurrency)).toEqual(['ILS', 'ILS', 'USD', 'EUR', 'ILS']);
+  expect(r.compatibility.find(e => e.field === 'reviewChecks')?.kinds).toEqual(
+    expect.arrayContaining(['currencyAssumedILS', 'invalidCurrency', 'explicitForeignCurrency']),
+  );
+  const foreign = await fixture([], {
+    data: debitData([{ ...row, billingAmountCurrency: undefined }], undefined, {
+      currencySymbolImmediateVouchers: '$',
+    }),
+  }).run();
+  expect(foreign.accounts[0].txns[0].chargedCurrency).toBe('USD');
+});
+test('immediate groups admit todays actual charges but never approvals, missing dates or future processing', async () => {
+  const f = fixture([], { bill: '20/11/2026', data: debitData([row], '23/10/2026') });
+  const r = await fetchIsracardWebTransactions(f.page as unknown as Page, { ...limits, to: '2026-10-23' });
+  expect(r.accounts[0].txns[0]).toMatchObject({
+    status: TransactionStatuses.Completed,
+    settlement: 'immediate',
+    processedDate: '2026-10-23T00:00:00.000Z',
+  });
+  for (const date of ['bad-date', null, '24/10/2026']) {
+    const r = await fixture([], { data: debitData([row], date) }).run();
+    expect(r.accounts[0].txns.every(t => t.status === TransactionStatuses.Pending)).toBe(true);
+    expect(r.compatibility.find(e => e.field === 'reviewChecks')?.kinds).toContain(
+      date === '24/10/2026' ? 'futureCharge' : 'missingChargeDate',
+    );
+  }
+});
+test('immediate vouchers repeated in a monthly list or response are not imported twice and totals are not transactions', async () => {
+  const data = debitData([row, row]);
+  data.israelAbroadVouchers.vouchers.israelAbroadVouchersList = [row] as unknown[];
+  const r = await fixture([], { data }).run();
+  expect(r.accounts[0].txns).toHaveLength(1);
+  expect(r.accounts[0].txns[0].processedDate).toBe('2026-10-21T00:00:00.000Z');
+  const conflict = await fixture([], { data: debitData([row, { ...row, billingAmount: 99 }]) }).run();
+  expect(conflict.accounts[0].txns.every(t => t.status === TransactionStatuses.Pending)).toBe(true);
+  expect(conflict.compatibility.find(e => e.field === 'reviewChecks')?.kinds).toContain('conflictingDuplicate');
 });

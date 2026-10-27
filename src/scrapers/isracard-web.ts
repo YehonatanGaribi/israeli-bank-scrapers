@@ -7,7 +7,7 @@ import { isracardWebRequest, nativeIsracardCards, type IsracardWireResponse } fr
 
 type Value = Record<string, unknown>;
 type WebTransaction = Omit<Transaction, 'originalAmount' | 'originalCurrency'> &
-  Partial<Pick<Transaction, 'originalAmount' | 'originalCurrency'>>;
+  Partial<Pick<Transaction, 'originalAmount' | 'originalCurrency'>> & { settlement?: 'immediate' };
 const fields = [
   'cardSuffix',
   'companyCode',
@@ -30,7 +30,34 @@ const fields = [
   'responseResult',
   'responseSuccess',
   'responseError',
+  'immediateChargeDate',
+  'billingAmountCurrencySymbol',
+  'reviewChecks',
 ] as const;
+const reviewChecks = [
+  'unposted',
+  'bankPartial',
+  'revolving',
+  'missingChargeDate',
+  'wrongMonth',
+  'futureCharge',
+  'missingPurchaseDate',
+  'dateOrder',
+  'invalidAmount',
+  'invalidCurrency',
+  'invalidReference',
+  'invalidDescription',
+  'invalidInstallments',
+  'posted',
+  'immediate',
+  'currencyAssumedILS',
+  'explicitForeignCurrency',
+  'conflictingDuplicate',
+  'accountUnsupported',
+  'invalidOriginalAmount',
+  'outsideRange',
+] as const;
+type ReviewCheck = (typeof reviewChecks)[number];
 type Kind =
   | 'missing'
   | 'null'
@@ -50,7 +77,8 @@ type Kind =
   | 'jsonString'
   | 'neutralCode'
   | 'nonzeroCode'
-  | 'ambiguous';
+  | 'ambiguous'
+  | ReviewCheck;
 type Profile = Array<{ field: (typeof fields)[number]; kinds: Kind[] }>;
 export interface IsracardWebResult {
   success: true;
@@ -137,6 +165,10 @@ function makeProfile() {
     ambiguous() {
       entries[0].kinds.add('ambiguous');
     },
+    check(...values: ReviewCheck[]) {
+      for (const value of values)
+        if ((reviewChecks as readonly string[]).includes(value)) entries[entries.length - 1].kinds.add(value);
+    },
     snapshot(): Profile {
       return entries.map(entry => ({ field: entry.field, kinds: [...entry.kinds].sort() }));
     },
@@ -161,12 +193,22 @@ function amount(value: unknown): number | undefined {
   const result = Number(text);
   return minor(String(result)) === cents ? result : undefined;
 }
-function currency(value: unknown): string | undefined {
+function currency(input: unknown): string | undefined {
+  const value = typeof input === 'string' ? input.trim().toUpperCase() : input;
   if (value === 0 || value === '0' || value === 'ILS' || value === 'NIS' || value === '₪' || value === 'ש"ח')
     return 'ILS';
-  if (value === 19 || value === '19' || value === 'USD') return 'USD';
-  if (value === 100 || value === '100' || value === 'EUR') return 'EUR';
+  if (value === 'ש״ח' || value === 'שח') return 'ILS';
+  if (value === 19 || value === '19' || value === 'USD' || value === '$' || value === 'US$') return 'USD';
+  if (value === 100 || value === '100' || value === 'EUR' || value === '€') return 'EUR';
+  if (value === '£') return 'GBP';
   return typeof value === 'string' && /^[A-Z]{3}$/.test(value) ? value : undefined;
+}
+const absent = (value: unknown) => value == null || (typeof value === 'string' && value.trim() === '');
+function billedCurrency(code: unknown, symbol: unknown): { currency?: string; assumed: boolean } {
+  const explicit = [code, symbol].filter(value => !absent(value));
+  if (!explicit.length) return { currency: 'ILS', assumed: true };
+  const known = new Set(explicit.map(currency).filter((value): value is string => value !== undefined));
+  return { currency: known.size === 1 ? [...known][0] : undefined, assumed: false };
 }
 function pending(date: string): WebTransaction {
   return {
@@ -190,6 +232,7 @@ function canonical(row: unknown): Value {
     purchaseDate: field(row, 'purchaseDate', 'fullPurchaseDate'),
     billingAmount: field(row, 'billingAmount', 'paymentSum', 'actualPaymentAmount'),
     billingAmountCurrency: field(row, 'billingAmountCurrency', 'chargedCurrency', 'paymentCurrency', 'currencyId'),
+    billingAmountCurrencySymbol: field(row, 'billingAmountCurrencySymbol', 'currencySymbol'),
     businessName: field(row, 'businessName', 'merchantName', 'fullSupplierNameHeb', 'description'),
     numberOfInstallment: field(row, 'numberOfInstallment', 'totalInstallments'),
     currentInstallmentNum: field(row, 'currentInstallmentNum', 'installmentNumber'),
@@ -391,13 +434,13 @@ export async function fetchIsracardWebTransactions(
       posted = Array.isArray(data) ? data : decode(field(data, 'transactions', 'transactionsList'));
       explicitPosted = false;
     }
-    const postedRows = Array.isArray(posted) ? posted : [];
     const base = { ...block.card.raw, billingDate: rawDate, isMonthlyPayment: monthly };
     summary.note(base);
     const markPending = (items: unknown) => {
       if (!Array.isArray(items)) return;
       if ((scanned += items.length) > maxRows)
         throw new IsracardWebError('transactionsValidation', 200, summary.snapshot());
+      if (items.length) summary.check('unposted');
       for (const item of items) {
         summary.note({ ...base, ...canonical(item), billingDate: rawDate, isMonthlyPayment: monthly });
         if (billingDate && billingDate >= from && billingDate <= to) account.txns.push(pending(billingDate));
@@ -405,75 +448,139 @@ export async function fetchIsracardWebTransactions(
     };
     markPending(field(field(data, 'approvals'), 'approvedTransactions'));
     markPending(field(vouchers, 'informativeOnlyVouchers'));
-    const outside = field(group, 'outOfStatementChargeDateVouchers');
-    if (Array.isArray(outside)) for (const item of outside) markPending(field(item, 'immediateVouchersCurrencyDate'));
-    if ((scanned += postedRows.length) > maxRows)
+    const movements: Array<{
+      row: unknown;
+      immediate: boolean;
+      chargeDate?: unknown;
+      code?: unknown;
+      symbol?: unknown;
+    }> = [];
+    const outside = decode(field(group, 'outOfStatementChargeDateVouchers'));
+    if (Array.isArray(outside))
+      for (const item of outside) {
+        const rows = decode(field(item, 'immediateVouchersCurrencyDate'));
+        if (!Array.isArray(rows)) continue;
+        const header = field(item, 'totalVouchersCurrencyDate');
+        for (const row of rows)
+          movements.push({
+            row,
+            immediate: true,
+            chargeDate: field(header, 'dateImmediateVouchers'),
+            code: field(header, 'currencyImmediateVouchers'),
+            symbol: field(header, 'currencySymbolImmediateVouchers'),
+          });
+      }
+    // Immediate charge groups supply the actual processing date. A monthly list
+    // may repeat the same voucher; never post it again on the statement date.
+    const voucherKey = (value: unknown) => {
+      const raw = canonical(value),
+        reference =
+          typeof raw.seqVoucherNumber === 'string' || typeof raw.seqVoucherNumber === 'number'
+            ? String(raw.seqVoucherNumber)
+            : '';
+      return /^\d{1,64}$/.test(reference) && !/^0+$/.test(reference)
+        ? JSON.stringify([reference, raw.currentInstallmentNum ?? 0, raw.numberOfInstallment ?? 0])
+        : undefined;
+    };
+    const immediateKeys = new Set(movements.map(item => voucherKey(item.row)).filter(Boolean));
+    if (Array.isArray(posted))
+      for (const row of posted) {
+        if (!immediateKeys.has(voucherKey(row))) movements.push({ row, immediate: false });
+      }
+    if ((scanned += movements.length) > maxRows)
       throw new IsracardWebError('transactionsValidation', 200, summary.snapshot());
     const blockedResponse = [...block.billing.errors, ...block.transactions.errors].some(code =>
       ['11', '13', '22', '500'].includes(String(code)),
     );
-    for (const row of postedRows) {
-      const raw = canonical(row);
-      summary.note({ ...base, ...raw, billingDate: raw.billingDate ?? rawDate, isMonthlyPayment: monthly });
+    for (const movement of movements) {
+      const { row, immediate } = movement,
+        raw = canonical(row);
+      const rawPayment = immediate ? movement.chargeDate : absent(raw.billingDate) ? rawDate : raw.billingDate;
       const purchase = day(raw.purchaseDate),
-        payment = day(raw.billingDate) ?? billingDate;
+        payment = day(rawPayment);
+      let code = raw.billingAmountCurrency,
+        symbol = raw.billingAmountCurrencySymbol;
+      if (absent(code) && absent(symbol) && immediate) {
+        code = movement.code;
+        symbol = movement.symbol;
+      }
+      summary.note({
+        ...base,
+        ...raw,
+        billingDate: rawPayment,
+        ...(immediate ? { immediateChargeDate: movement.chargeDate } : {}),
+        billingAmountCurrency: code,
+        billingAmountCurrencySymbol: symbol,
+      });
+      const billed = billedCurrency(code, symbol),
+        chargedCurrency = billed.currency,
+        charged = amount(raw.billingAmount);
+      if (billed.assumed) summary.check('currencyAssumedILS');
+      if (chargedCurrency && chargedCurrency !== 'ILS') summary.check('explicitForeignCurrency');
       const status = field(row, 'status', 'transactionStatus'),
         completed =
           typeof status === 'string' && ['completed', 'posted', 'settled', 'final'].includes(status.toLowerCase());
-      const uncertain =
-        blockedResponse ||
-        flag(monthly) === true ||
-        (monthly != null && monthly !== '' && flag(monthly) === undefined) ||
-        (!explicitPosted && !completed) ||
+      const reference =
+        typeof raw.seqVoucherNumber === 'string'
+          ? raw.seqVoucherNumber.trim()
+          : typeof raw.seqVoucherNumber === 'number' && Number.isSafeInteger(raw.seqVoucherNumber)
+            ? String(raw.seqVoucherNumber)
+            : '';
+      const part = absent(raw.currentInstallmentNum) ? 0 : integer(raw.currentInstallmentNum),
+        count = absent(raw.numberOfInstallment) ? 0 : integer(raw.numberOfInstallment);
+      const checks: ReviewCheck[] = [];
+      if (blockedResponse) checks.push('bankPartial');
+      if (!immediate && (flag(monthly) === true || (!absent(monthly) && flag(monthly) === undefined)))
+        checks.push('revolving');
+      if (
+        (!immediate && !explicitPosted && !completed) ||
+        (status != null && !completed) ||
         ['isPending', 'isFuture', 'isCancelled', 'pending', 'cancelled', 'isAuthorization'].some(
           name => flag(field(row, name)) === true,
-        ) ||
-        (status != null && !completed);
-      const charged = amount(raw.billingAmount),
-        chargedCurrency = currency(raw.billingAmountCurrency),
-        reference =
-          typeof raw.seqVoucherNumber === 'string'
-            ? raw.seqVoucherNumber.trim()
-            : typeof raw.seqVoucherNumber === 'number' && Number.isSafeInteger(raw.seqVoucherNumber)
-              ? String(raw.seqVoucherNumber)
-              : '';
-      const part =
-          raw.currentInstallmentNum == null || raw.currentInstallmentNum === ''
-            ? 0
-            : integer(raw.currentInstallmentNum),
-        count =
-          raw.numberOfInstallment == null || raw.numberOfInstallment === '' ? 0 : integer(raw.numberOfInstallment);
-      const valid =
-        record(row) &&
-        !uncertain &&
-        (raw.billingDate == null || raw.billingDate === '' || day(raw.billingDate) !== undefined) &&
-        purchase &&
-        payment &&
-        billingDate &&
-        billingDate.slice(0, 7) === block.month &&
-        payment.slice(0, 7) === block.month &&
-        purchase <= payment &&
-        payment < today &&
-        billingDate < today &&
-        charged !== undefined &&
-        charged !== 0 &&
-        chargedCurrency &&
-        /^\d{1,64}$/.test(reference) &&
-        !/^0+$/.test(reference) &&
-        typeof raw.businessName === 'string' &&
-        raw.businessName.trim().length > 0 &&
-        raw.businessName.length <= 4000 &&
-        part !== undefined &&
-        count !== undefined &&
-        part <= count &&
-        count <= 1200 &&
-        (part === 0) === (count === 0);
-      if (!valid) {
-        const date = payment ?? billingDate ?? `${block.month}-01`;
+        )
+      )
+        checks.push('unposted');
+      if (!payment || (!immediate && !billingDate)) checks.push('missingChargeDate');
+      if (
+        !immediate &&
+        ((billingDate && billingDate.slice(0, 7) !== block.month) || (payment && payment.slice(0, 7) !== block.month))
+      )
+        checks.push('wrongMonth');
+      if (
+        (payment && (payment > today || (!immediate && payment === today))) ||
+        (!immediate && billingDate && billingDate >= today)
+      )
+        checks.push('futureCharge');
+      if (!purchase) checks.push('missingPurchaseDate');
+      if (purchase && payment && purchase > payment) checks.push('dateOrder');
+      if (charged === undefined || charged === 0) checks.push('invalidAmount');
+      if (!chargedCurrency) checks.push('invalidCurrency');
+      if (!/^\d{1,64}$/.test(reference) || /^0+$/.test(reference)) checks.push('invalidReference');
+      if (
+        !record(row) ||
+        typeof raw.businessName !== 'string' ||
+        !raw.businessName.trim() ||
+        raw.businessName.length > 4000
+      )
+        checks.push('invalidDescription');
+      if (part === undefined || count === undefined || part > count || count > 1200 || (part === 0) !== (count === 0))
+        checks.push('invalidInstallments');
+      summary.check(...checks);
+      if (
+        checks.length ||
+        !purchase ||
+        !payment ||
+        charged === undefined ||
+        !chargedCurrency ||
+        part === undefined ||
+        count === undefined
+      ) {
+        const date = payment ?? billingDate ?? (`${block.month}-01` < from ? from : `${block.month}-01`);
         if (date >= from && date <= to) account.txns.push(pending(date));
         continue;
       }
       if (payment < from || payment > to) continue;
+      summary.check('posted', ...(immediate ? ['immediate' as const] : []));
       const originalCurrency = currency(raw.originalCurrency),
         originalAmount = amount(raw.originalAmount);
       account.txns.push({
@@ -485,12 +592,38 @@ export async function fetchIsracardWebTransactions(
         chargedCurrency,
         description: raw.businessName as string,
         status: TransactionStatuses.Completed,
+        ...(immediate ? { settlement: 'immediate' as const } : {}),
         ...(count > 1 ? { installments: { number: part, total: count } } : {}),
         ...(originalCurrency && originalAmount !== undefined
           ? { originalCurrency, originalAmount: -originalAmount }
           : {}),
       });
     }
+  }
+  for (const account of accounts) {
+    const unique: WebTransaction[] = [],
+      seen = new Map<string, WebTransaction | null>();
+    for (const transaction of account.txns) {
+      if (transaction.status !== TransactionStatuses.Completed) {
+        unique.push(transaction);
+        continue;
+      }
+      const key = JSON.stringify([transaction.identifier, transaction.processedDate, transaction.installments]);
+      const existing = seen.get(key);
+      if (existing === undefined) {
+        seen.set(key, transaction);
+        unique.push(transaction);
+        continue;
+      }
+      if (existing && JSON.stringify(existing) === JSON.stringify(transaction)) continue;
+      summary.check('conflictingDuplicate');
+      if (existing) {
+        unique.splice(unique.indexOf(existing), 1);
+        unique.push(pending(transaction.processedDate.slice(0, 10)));
+      }
+      seen.set(key, null);
+    }
+    account.txns = unique;
   }
   return { success: true, accounts, compatibility: summary.snapshot() };
 }
