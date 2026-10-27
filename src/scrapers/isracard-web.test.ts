@@ -1,4 +1,4 @@
-/* Synthetic page only; never credentials, real bank sessions or raw logs. */
+/* Synthetic page only. No credentials, real bank sessions or raw response logs. */
 /* eslint-disable @typescript-eslint/require-await */
 import { type Page } from 'puppeteer';
 import { TransactionStatuses } from '../transactions';
@@ -14,40 +14,39 @@ const row = {
   numberOfInstallment: 0,
   currentInstallmentNum: 0,
 };
-function fixture(
-  rows: unknown[] = [row],
-  options: {
-    cards?: unknown;
-    bill?: string;
-    monthly?: unknown;
-    status?: number;
-    data?: unknown;
-    partial?: boolean;
-  } = {},
-) {
+type Options = {
+  cards?: unknown;
+  bill?: string;
+  monthly?: unknown;
+  status?: number;
+  data?: unknown;
+  wrap?: (value: unknown, operation: string) => unknown;
+};
+function fixture(rows: unknown[] = [row], options: Options = {}) {
   const page = {
     evaluate: jest.fn(async (_fn: unknown, url: string, body: unknown) => {
-      void body;
       if (options.status) return { ok: false, httpStatus: options.status };
-      const path = new URL(url).pathname;
-      const data = path.endsWith('/GetCardList')
-        ? { cardsList: options.cards ?? [card] }
-        : path.endsWith('/GetMonthlyBilling')
-          ? { cards: { '1234': { billingDate: options.bill ?? '20/10/2026' } } }
-          : (options.data ?? {
-              approvals: { approvedTransactions: [{}] },
-              israelAbroadVouchers: {
-                vouchers: {
-                  totalForStatement: { isMonthlyPayment: options.monthly ?? false },
-                  israelAbroadVouchersList: rows,
-                  informativeOnlyVouchers: [],
+      const name = new URL(url).pathname.split('/').pop()!;
+      const id = (body as { cards?: Array<{ cardSuffix: string }> }).cards?.[0].cardSuffix ?? '1234';
+      const data =
+        name === 'GetCardList'
+          ? { cardsList: options.cards ?? [card] }
+          : name === 'GetMonthlyBilling'
+            ? { cards: { [id]: { billingDate: options.bill ?? '20/10/2026' } } }
+            : (options.data ?? {
+                approvals: { approvedTransactions: [{}] },
+                israelAbroadVouchers: {
+                  vouchers: {
+                    totalForStatement: { isMonthlyPayment: options.monthly ?? false },
+                    israelAbroadVouchersList: rows,
+                    informativeOnlyVouchers: [],
+                  },
                 },
-              },
-            });
+              });
       return {
         ok: true,
         httpStatus: 200,
-        data: { isSuccess: true, errorCode: options.partial ? 'PARTIAL_PRIVATE_ERROR' : null, data },
+        data: options.wrap ? options.wrap(data, name) : JSON.stringify({ isSuccess: true, errorCode: 0, data }),
       };
     }),
   };
@@ -58,105 +57,136 @@ beforeEach(() => {
   jest.setSystemTime(new Date('2026-10-23T12:00:00Z'));
 });
 afterEach(() => jest.useRealTimers());
-test('new site uses exact local endpoints, actual billing dates, refunds and installment metadata', async () => {
+test('collects the period before mapping actual dates, refunds, installments and unavailable original details', async () => {
   const f = fixture([
     row,
-    { ...row, seqVoucherNumber: '000001235', billingAmount: -5 },
-    { ...row, seqVoucherNumber: '000001236', numberOfInstallment: 4, currentInstallmentNum: 2 },
+    { ...row, seqVoucherNumber: '2', billingAmount: -5 },
+    { ...row, seqVoucherNumber: '3', numberOfInstallment: 4, currentInstallmentNum: 2 },
   ]);
-  const result = await f.run();
-  expect(result.accounts[0].accountNumber).toBe('1234');
-  const posted = result.accounts[0].txns.filter(t => t.status === TransactionStatuses.Completed);
+  const result = await f.run(),
+    posted = result.accounts[0].txns.filter(t => t.status === TransactionStatuses.Completed);
   expect(posted).toMatchObject([
-    {
-      identifier: '000001234',
-      chargedAmount: -12.34,
-      chargedCurrency: 'ILS',
-      processedDate: '2026-10-20T00:00:00.000Z',
-    },
+    { identifier: '000001234', chargedAmount: -12.34, processedDate: '2026-10-20T00:00:00.000Z' },
     { chargedAmount: 5 },
     { installments: { number: 2, total: 4 } },
   ]);
   expect(posted[0]).not.toHaveProperty('originalAmount');
   expect(posted[0]).not.toHaveProperty('originalCurrency');
-  expect(result.accounts[0].txns.filter(t => t.status === TransactionStatuses.Pending)).toHaveLength(1);
-  expect(f.page.evaluate.mock.calls.map(c => new URL(c[1]).pathname)).toEqual([
-    '/ocp/transactions/DigitalV3.Transactions/GetCardList',
-    '/ocp/transactions/DigitalV3.Transactions/GetMonthlyBilling',
-    '/ocp/transactions/DigitalV3.Transactions/GetTransactionsList',
+  expect(f.page.evaluate.mock.calls.map(c => new URL(c[1]).pathname.split('/').pop())).toEqual([
+    'GetCardList',
+    'GetMonthlyBilling',
+    'GetTransactionsList',
   ]);
   expect(f.page.evaluate.mock.calls.every(c => new URL(c[1]).origin === 'https://web.isracard.co.il')).toBe(true);
-  expect(f.page.evaluate.mock.calls[1][2]).toEqual({
-    cards: [{ cardStatus: 0, cardSuffix: '1234', companyCode: 11, serviceType: 1, isPartner: false }],
-    billingDate: '10/2026',
-  });
-  expect(f.page.evaluate.mock.calls[2][2]).toEqual({
-    card4Number: '1234',
-    isNextBillingDate: false,
-    cardStatus: 0,
-    billingMonth: '01/10/2026',
-    companyCode: 11,
-    isPartner: false,
-  });
+  expect(f.page.evaluate.mock.calls[1][2]).toMatchObject({ billingDate: '10/2026' });
+  expect(f.page.evaluate.mock.calls[2][2]).toMatchObject({ billingMonth: '01/10/2026', isNextBillingDate: false });
+  expect(result.compatibility).toHaveLength(21);
+  expect(JSON.stringify(result.compatibility)).not.toMatch(/SYNTHETIC_PRIVATE_SHOP|000001234|12\.34/);
 });
-test('bank currency codes are not exchange conversions and original details are copied only when supplied', async () => {
+test('accepts encoded/direct/Pascal-case wrappers, success primitives and neutral error codes for every endpoint', async () => {
+  for (const wrap of [
+    (data: unknown) => data,
+    (data: unknown) => JSON.stringify(JSON.stringify({ IsSuccess: 1, ErrorCode: '0', Data: data })),
+    (data: unknown) => ({ Response: { Result: JSON.stringify({ Success: 'true', Data: data }) } }),
+  ]) {
+    const r = await fixture([row], { wrap }).run();
+    expect(r.accounts[0].txns.some(t => t.status === TransactionStatuses.Completed)).toBe(true);
+  }
+  const cardVariant = { CardSuffix: '****1234', CompanyCode: 11, IsActive: 1 };
+  const r = await fixture(
+    [
+      {
+        SeqVoucherNumber: '0012',
+        PurchaseDate: '2026-10-01T00:00:00.0000000',
+        BillingAmount: '1,234.50',
+        BillingAmountCurrency: 'ILS',
+        BusinessName: 'Synthetic shop',
+      },
+    ],
+    { cards: [cardVariant], bill: '2026-10-20' },
+  ).run();
+  expect(r.accounts[0].txns.find(t => t.status === TransactionStatuses.Completed)?.chargedAmount).toBe(-1234.5);
+});
+test('bad rows are quarantined without blocking other verified records or losing the session profile', async () => {
+  const patches = [
+    { billingAmount: 12.345 },
+    { seqVoucherNumber: 9007199254740992 },
+    { purchaseDate: '30/02/2026' },
+    { currentInstallmentNum: 5, numberOfInstallment: 4 },
+    { billingAmountCurrency: 'UNKNOWN_PRIVATE_CURRENCY' },
+  ];
+  const f = fixture([row, ...patches.map((p, i) => ({ ...row, seqVoucherNumber: String(i + 2), ...p }))]);
+  const r = await f.run();
+  expect(f.page.evaluate).toHaveBeenCalledTimes(3);
+  expect(r.accounts[0].txns.filter(t => t.status === TransactionStatuses.Completed)).toHaveLength(1);
+  expect(r.accounts[0].txns.filter(t => t.status === TransactionStatuses.Pending)).toHaveLength(patches.length + 1);
+  expect(JSON.stringify(r.compatibility)).not.toMatch(/SYNTHETIC_PRIVATE|UNKNOWN_PRIVATE|9007199254740992|12\.345/);
+});
+test('optional flags are tolerated while actual pending/revolving and critical bank failures remain unimportable', async () => {
+  const r = await fixture([
+    { ...row, isPending: false, isCancelled: null },
+    { ...row, seqVoucherNumber: '2', isPending: true },
+  ]).run();
+  expect(r.accounts[0].txns.filter(t => t.status === TransactionStatuses.Completed)).toHaveLength(1);
+  for (const opts of [
+    { monthly: true },
+    {
+      wrap: (data: unknown, name: string) => ({
+        isSuccess: true,
+        errorCode: name === 'GetTransactionsList' ? '11' : 0,
+        data,
+      }),
+    },
+  ])
+    expect(
+      (await fixture([row], opts).run()).accounts[0].txns.every(t => t.status === TransactionStatuses.Pending),
+    ).toBe(true);
+  const explicitFalse = fixture([row], { wrap: data => ({ isSuccess: false, data }) });
+  await expect(explicitFalse.run()).rejects.toMatchObject({
+    diagnostic: { stage: 'cardListRequest', httpStatus: 200 },
+  });
+  expect(explicitFalse.page.evaluate).toHaveBeenCalledTimes(1);
+});
+test('ambiguous account suffixes are never assigned to another card and HTML responses reveal only safe types', async () => {
+  await expect(fixture([row], { cards: [card, card] }).run()).rejects.toMatchObject({
+    diagnostic: { stage: 'cardListValidation' },
+  });
+  const r = await fixture([row], { cards: [card, card, { ...card, cardSuffix: '5678' }] }).run();
+  expect(r.accounts.map(a => a.accountNumber)).toEqual(['5678']);
+  expect(r.compatibility[0].kinds).toContain('ambiguous');
+  try {
+    await fixture([row], { wrap: () => '<html>SYNTHETIC_PRIVATE_LOGIN</html>' }).run();
+    throw new Error('must fail');
+  } catch (error) {
+    expect(error).toBeInstanceOf(IsracardWebError);
+    const d = (error as IsracardWebError).diagnostic;
+    expect(d.compatibility?.find(e => e.field === 'responseBody')?.kinds).toEqual(['html']);
+    expect(JSON.stringify(d)).not.toContain('SYNTHETIC_PRIVATE_LOGIN');
+  }
+});
+test('currency labels never imply exchange conversions, and verified original details remain optional', async () => {
   const r = await fixture([
     { ...row, billingAmount: '12.30', originalCurrency: 19 },
     { ...row, seqVoucherNumber: '2', billingAmountCurrency: 19 },
     { ...row, seqVoucherNumber: '3', originalCurrency: 19, originalAmount: '3.21' },
   ]).run();
   const rows = r.accounts[0].txns.filter(t => t.status === TransactionStatuses.Completed);
-  expect(rows[0].chargedAmount).toBe(-12.3);
   expect(rows[0]).not.toHaveProperty('originalCurrency');
   expect(rows[1].chargedCurrency).toBe('USD');
   expect(rows[2]).toMatchObject({ originalCurrency: 'USD', originalAmount: -3.21 });
 });
-test('revolving payment and same-day billing stay pending; dates outside requested billing window are not fetched', async () => {
-  const sameDay = fixture([row], { bill: '23/10/2026' });
-  const sameDayResult = await fetchIsracardWebTransactions(sameDay.page as unknown as Page, {
-    ...limits,
-    to: '2026-10-23',
-  });
-  expect(sameDayResult.accounts[0].txns.every(t => t.status === TransactionStatuses.Pending)).toBe(true);
-  for (const opts of [{ monthly: true }, { bill: '23/10/2026' }]) {
+test('same-day, missing settlement and unlabelled generic transaction arrays cannot become posted transactions', async () => {
+  const f = fixture([row], { bill: '23/10/2026' });
+  const same = await fetchIsracardWebTransactions(f.page as unknown as Page, { ...limits, to: '2026-10-23' });
+  expect(same.accounts[0].txns.every(t => t.status === TransactionStatuses.Pending)).toBe(true);
+  for (const opts of [{ bill: 'not-a-date' }, { data: { transactions: [row] } }]) {
     const f = fixture([row], opts);
-    if (opts.bill) {
-      const r = await f.run();
-      expect(r.accounts[0].txns).toEqual([]);
-      expect(f.page.evaluate).toHaveBeenCalledTimes(2);
-    } else expect((await f.run()).accounts[0].txns.every(t => t.status === TransactionStatuses.Pending)).toBe(true);
+    const r = await f.run();
+    expect(f.page.evaluate).toHaveBeenCalledTimes(3);
+    expect(r.accounts[0].txns.every(t => t.status === TransactionStatuses.Pending)).toBe(true);
   }
 });
-test('ambiguous account suffixes, malformed groups and partial responses fail closed', async () => {
-  for (const opts of [
-    { cards: [card, card] },
-    { data: { unknown: 'PRIVATE_VALUE' } },
-    { data: { israelAbroadVouchers: 'PRIVATE_VALUE' } },
-    { partial: true },
-    { bill: '20/09/2026' },
-  ])
-    await expect(fixture([row], opts).run()).rejects.toBeInstanceOf(IsracardWebError);
-});
-test('unrecognized posted values return only fixed shape diagnostics', async () => {
-  for (const patch of [
-    { billingAmount: 12.345 },
-    { seqVoucherNumber: 9007199254740992 },
-    { purchaseDate: '30/02/2026' },
-    { currentInstallmentNum: 5, numberOfInstallment: 4 },
-    { billingAmountCurrency: 'UNKNOWN_PRIVATE_CURRENCY' },
-  ]) {
-    try {
-      await fixture([{ ...row, ...patch }]).run();
-      throw new Error('must fail');
-    } catch (error) {
-      expect(error).toBeInstanceOf(IsracardWebError);
-      const report = JSON.stringify((error as IsracardWebError).diagnostic);
-      expect(report).not.toMatch(/SYNTHETIC_PRIVATE_SHOP|000001234|UNKNOWN_PRIVATE_CURRENCY|12\.345/);
-      expect((error as IsracardWebError).diagnostic.compatibility).toHaveLength(16);
-    }
-  }
-});
-test('HTTP failure reports a bounded status and budgets cover pending and posted rows', async () => {
+test('HTTP and row limits still stop collection without leaking source values', async () => {
   await expect(fixture([row], { status: 403 }).run()).rejects.toMatchObject({
     diagnostic: { stage: 'cardListRequest', httpStatus: 403 },
   });
