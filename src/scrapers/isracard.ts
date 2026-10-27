@@ -3,6 +3,8 @@ import { type Page } from 'puppeteer';
 import IsracardAmexBaseScraper from './base-isracard-amex';
 import { type ScraperOptions, type ScraperScrapingResult } from './interface';
 import { TransactionStatuses, TransactionTypes, type Transaction, type TransactionsAccount } from '../transactions';
+import { fetchIsracardWebTransactions, type IsracardWebResult } from './isracard-web';
+export { IsracardWebError } from './isracard-web';
 
 const BASE_URL = 'https://digital.isracard.co.il';
 const COMPANY_CODE = '11';
@@ -42,6 +44,11 @@ export class IsracardScraper extends IsracardAmexBaseScraper {
   /** Attach without the legacy initializer's network logging callbacks. */
   initializeDesktopPage(page: Page): void {
     this.page = page;
+  }
+
+  /** Current manually signed-in web site. Keep the legacy collector intact. */
+  async fetchDesktopWebTransactions(limits: IsracardDesktopLimits): Promise<IsracardWebResult> {
+    return fetchIsracardWebTransactions(this.page, limits);
   }
 
   /** Existing human-authenticated page only. Never invoke login, anti-bot
