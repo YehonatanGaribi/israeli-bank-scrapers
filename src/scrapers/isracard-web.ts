@@ -479,7 +479,11 @@ export async function fetchIsracardWebTransactions(
             ? String(raw.seqVoucherNumber)
             : '';
       return /^\d{1,64}$/.test(reference) && !/^0+$/.test(reference)
-        ? JSON.stringify([reference, raw.currentInstallmentNum ?? 0, raw.numberOfInstallment ?? 0])
+        ? JSON.stringify([
+            reference,
+            absent(raw.currentInstallmentNum) ? 0 : integer(raw.currentInstallmentNum),
+            absent(raw.numberOfInstallment) ? 0 : integer(raw.numberOfInstallment),
+          ])
         : undefined;
     };
     const immediateKeys = new Set(movements.map(item => voucherKey(item.row)).filter(Boolean));

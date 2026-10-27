@@ -264,7 +264,9 @@ test('immediate groups admit todays actual charges but never approvals, missing 
 });
 test('immediate vouchers repeated in a monthly list or response are not imported twice and totals are not transactions', async () => {
   const data = debitData([row, row]);
-  data.israelAbroadVouchers.vouchers.israelAbroadVouchersList = [row] as unknown[];
+  data.israelAbroadVouchers.vouchers.israelAbroadVouchersList = [
+    { ...row, numberOfInstallment: '0', currentInstallmentNum: '0' },
+  ] as unknown[];
   const r = await fixture([], { data }).run();
   expect(r.accounts[0].txns).toHaveLength(1);
   expect(r.accounts[0].txns[0].processedDate).toBe('2026-10-21T00:00:00.000Z');
