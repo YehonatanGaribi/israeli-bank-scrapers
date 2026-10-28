@@ -31,14 +31,14 @@ function fixture(rows: unknown[] = [row], options: Options = {}) {
       const id = (body as { cards?: Array<{ cardSuffix: string }> }).cards?.[0].cardSuffix ?? '1234';
       const request = body as { billingDate?: string; billingMonth?: string };
       const month = request.billingDate ?? request.billingMonth?.slice(3);
-      const primaryMonth = limits.from.slice(5, 7) + '/' + limits.from.slice(0, 4);
+      const primaryMonth = `${limits.from.slice(5, 7)}/${limits.from.slice(0, 4)}`;
       const data =
         name === 'GetCardList'
           ? { cardsList: options.cards ?? [card] }
           : name === 'GetMonthlyBilling'
             ? {
                 cards: {
-                  [id]: { billingDate: month === primaryMonth ? (options.bill ?? '20/10/2026') : '20/' + month },
+                  [id]: { billingDate: month === primaryMonth ? (options.bill ?? '20/10/2026') : `20/${month}` },
                 },
               }
             : (options.dataByMonth?.[month!] ??
