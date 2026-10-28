@@ -20,6 +20,7 @@ type Options = {
   monthly?: unknown;
   status?: number;
   data?: unknown;
+  dataByMonth?: Record<string, unknown>;
   wrap?: (value: unknown, operation: string) => unknown;
 };
 function fixture(rows: unknown[] = [row], options: Options = {}) {
@@ -28,12 +29,20 @@ function fixture(rows: unknown[] = [row], options: Options = {}) {
       if (options.status) return { ok: false, httpStatus: options.status };
       const name = new URL(url).pathname.split('/').pop()!;
       const id = (body as { cards?: Array<{ cardSuffix: string }> }).cards?.[0].cardSuffix ?? '1234';
+      const request = body as { billingDate?: string; billingMonth?: string };
+      const month = request.billingDate ?? request.billingMonth?.slice(3);
+      const primaryMonth = limits.from.slice(5, 7) + '/' + limits.from.slice(0, 4);
       const data =
         name === 'GetCardList'
           ? { cardsList: options.cards ?? [card] }
           : name === 'GetMonthlyBilling'
-            ? { cards: { [id]: { billingDate: options.bill ?? '20/10/2026' } } }
-            : (options.data ?? {
+            ? {
+                cards: {
+                  [id]: { billingDate: month === primaryMonth ? (options.bill ?? '20/10/2026') : '20/' + month },
+                },
+              }
+            : (options.dataByMonth?.[month!] ??
+              (month !== primaryMonth ? { postedTransactions: [] } : options.data) ?? {
                 approvals: { approvedTransactions: [{}] },
                 israelAbroadVouchers: {
                   vouchers: {
@@ -74,6 +83,8 @@ test('collects the period before mapping actual dates, refunds, installments and
   expect(posted[0]).not.toHaveProperty('originalCurrency');
   expect(f.page.evaluate.mock.calls.map(c => new URL(c[1]).pathname.split('/').pop())).toEqual([
     'GetCardList',
+    'GetMonthlyBilling',
+    'GetTransactionsList',
     'GetMonthlyBilling',
     'GetTransactionsList',
   ]);
@@ -117,7 +128,7 @@ test('bad rows are quarantined without blocking other verified records or losing
   ];
   const f = fixture([row, ...patches.map((p, i) => ({ ...row, seqVoucherNumber: String(i + 2), ...p }))]);
   const r = await f.run();
-  expect(f.page.evaluate).toHaveBeenCalledTimes(3);
+  expect(f.page.evaluate).toHaveBeenCalledTimes(5);
   expect(r.accounts[0].txns.filter(t => t.status === TransactionStatuses.Completed)).toHaveLength(1);
   expect(r.accounts[0].txns.filter(t => t.status === TransactionStatuses.Pending)).toHaveLength(patches.length + 1);
   expect(JSON.stringify(r.compatibility)).not.toMatch(/SYNTHETIC_PRIVATE|UNKNOWN_PRIVATE|9007199254740992|12\.345/);
@@ -182,7 +193,7 @@ test('same-day, missing settlement and unlabelled generic transaction arrays can
   for (const opts of [{ bill: 'not-a-date' }, { data: { transactions: [row] } }]) {
     const f = fixture([row], opts);
     const r = await f.run();
-    expect(f.page.evaluate).toHaveBeenCalledTimes(3);
+    expect(f.page.evaluate).toHaveBeenCalledTimes(5);
     expect(r.accounts[0].txns.every(t => t.status === TransactionStatuses.Pending)).toBe(true);
   }
 });
@@ -273,4 +284,68 @@ test('immediate vouchers repeated in a monthly list or response are not imported
   const conflict = await fixture([], { data: debitData([row, { ...row, billingAmount: 99 }]) }).run();
   expect(conflict.accounts[0].txns.every(t => t.status === TransactionStatuses.Pending)).toBe(true);
   expect(conflict.compatibility.find(e => e.field === 'reviewChecks')?.kinds).toContain('conflictingDuplicate');
+});
+
+test('reads the following statement month and keeps only selected charge dates, without repeating vouchers', async () => {
+  const repeated = { ...row, seqVoucherNumber: '101' };
+  const late = { ...row, seqVoucherNumber: '102', purchaseDate: '21/10/2026' };
+  const outside = { ...row, seqVoucherNumber: '103', purchaseDate: '23/10/2026' };
+  const f = fixture([], {
+    data: debitData([repeated], '20/10/2026'),
+    dataByMonth: {
+      '11/2026': {
+        israelAbroadVouchers: {
+          vouchers: { totalForStatement: { isMonthlyPayment: false }, israelAbroadVouchersList: [] },
+          outOfStatementChargeDateVouchers: [
+            ...debitData([repeated], '20/10/2026').israelAbroadVouchers.outOfStatementChargeDateVouchers,
+            ...debitData([late], '22/10/2026').israelAbroadVouchers.outOfStatementChargeDateVouchers,
+            ...debitData([outside], '23/10/2026').israelAbroadVouchers.outOfStatementChargeDateVouchers,
+          ],
+        },
+      },
+    },
+  });
+  const result = await f.run();
+  expect(result.accounts[0].txns.map(t => [t.identifier, t.processedDate])).toEqual([
+    ['101', '2026-10-20T00:00:00.000Z'],
+    ['102', '2026-10-22T00:00:00.000Z'],
+  ]);
+  expect(
+    f.page.evaluate.mock.calls.filter(c => String(c[1]).endsWith('/GetMonthlyBilling')).map(c => c[2]),
+  ).toMatchObject([{ billingDate: '10/2026' }, { billingDate: '11/2026' }]);
+});
+
+test('lookahead crosses December into January and never expands the selected charge-date range', async () => {
+  jest.setSystemTime(new Date('2027-01-05T12:00:00Z'));
+  const f = fixture([], {
+    dataByMonth: {
+      '01/2027': debitData([{ ...row, purchaseDate: '31/12/2026' }], '31/12/2026'),
+    },
+  });
+  const result = await fetchIsracardWebTransactions(f.page as unknown as Page, {
+    ...limits,
+    from: '2026-12-01',
+    to: '2026-12-31',
+  });
+  expect(result.accounts[0].txns).toHaveLength(1);
+  expect(result.accounts[0].txns[0].processedDate).toBe('2026-12-31T00:00:00.000Z');
+  expect(
+    f.page.evaluate.mock.calls.filter(c => String(c[1]).endsWith('/GetTransactionsList')).map(c => c[2]),
+  ).toMatchObject([{ billingMonth: '01/12/2026' }, { billingMonth: '01/01/2027' }]);
+});
+
+test('a twelve-month selection reads exactly thirteen views while longer selections still fail before requests', async () => {
+  const f = fixture([]);
+  await fetchIsracardWebTransactions(f.page as unknown as Page, { ...limits, from: '2025-11-01' });
+  const months = f.page.evaluate.mock.calls
+    .filter(c => String(c[1]).endsWith('/GetMonthlyBilling'))
+    .map(c => (c[2] as { billingDate: string }).billingDate);
+  expect(months).toHaveLength(13);
+  expect(months[0]).toBe('11/2025');
+  expect(months[12]).toBe('11/2026');
+  f.page.evaluate.mockClear();
+  await expect(
+    fetchIsracardWebTransactions(f.page as unknown as Page, { ...limits, from: '2025-10-01' }),
+  ).rejects.toBeInstanceOf(IsracardWebError);
+  expect(f.page.evaluate).not.toHaveBeenCalled();
 });

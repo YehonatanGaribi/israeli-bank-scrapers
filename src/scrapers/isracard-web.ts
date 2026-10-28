@@ -371,9 +371,11 @@ export async function fetchIsracardWebTransactions(
   const cards = candidates.filter(card => !duplicates.has(card.id));
   if (rows.length && !cards.length) throw new IsracardWebError('cardListValidation', 200, summary.snapshot());
   const blocks: Block[] = [],
-    months = end.clone().startOf('month').diff(start.clone().startOf('month'), 'months') + 1;
-  // Do not abort at the first optional field or malformed row. Gather the period
-  // before mapping it so one review/report describes the entire session.
+    months = end.clone().startOf('month').diff(start.clone().startOf('month'), 'months') + 2;
+  // A statement view can contain charges processed in the previous month.
+  // Read one view beyond the requested end month (at most 13 views for a
+  // 12-month range), then retain only actual charge dates inside from/to.
+  // Gather the period before mapping so one review/report covers the session.
   for (let offset = 0; offset < months; offset++)
     for (const card of cards) {
       const month = start.clone().startOf('month').add(offset, 'months');
